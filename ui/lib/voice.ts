@@ -384,16 +384,17 @@ export function browserVoices(): SpeechSynthesisVoice[] {
   return window.speechSynthesis.getVoices();
 }
 
+const browserVoiceListing = store<SpeechSynthesisVoice[]>([]);
+
 export function useBrowserVoices(): SpeechSynthesisVoice[] {
-  const listing = store<SpeechSynthesisVoice[]>([]);
   useEffect(() => {
     if (typeof window === 'undefined' || !window.speechSynthesis) return;
-    const update = () => listing.set(browserVoices());
+    const update = () => browserVoiceListing.set(browserVoices());
     update();
     window.speechSynthesis.addEventListener?.('voiceschanged', update);
     return () => window.speechSynthesis.removeEventListener?.('voiceschanged', update);
   }, []);
-  return useSyncExternalStore(listing.subscribe, listing.get, () => []);
+  return useSyncExternalStore(browserVoiceListing.subscribe, browserVoiceListing.get, () => []);
 }
 
 // ─── Auto-speak preference (per browser) ───────────────────────────
