@@ -164,6 +164,12 @@ export function reduceTurn(turn: AssistantTurn, ev: StreamEvent): AssistantTurn 
       return { ...turn, started: true, userMessageId: ev.user_message_id ?? null };
     case 'step_start':
       return { ...turn, step: ev.step };
+    case 'snapshot': {
+      const blocks: Block[] = turn.blocks.filter((b) => b.kind !== 'text' && b.kind !== 'reasoning');
+      if (ev.reasoning) blocks.push({ kind: 'reasoning', key: uid('reasoning'), text: ev.reasoning });
+      if (ev.text) blocks.push({ kind: 'text', key: uid('text'), text: ev.text });
+      return { ...turn, blocks, step: typeof ev.step === 'number' ? ev.step : turn.step };
+    }
     case 'text':
       return appendDelta(turn, 'text', ev.content);
     case 'reasoning':

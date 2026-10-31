@@ -159,6 +159,7 @@ export type StreamEvent =
   | ({ type: 'memory_recall'; items: RecallItem[] } & Seq)
   | ({ type: 'skills_suggested'; skills: SkillSuggestion[] } & Seq)
   | ({ type: 'step_start'; step: number } & Seq)
+  | ({ type: 'snapshot'; text?: string; reasoning?: string; step?: number } & Seq)
   | ({ type: 'text'; content: string } & Seq)
   | ({ type: 'reasoning'; content: string } & Seq)
   | ({ type: 'message'; message_id: number | null; role: string } & Seq)

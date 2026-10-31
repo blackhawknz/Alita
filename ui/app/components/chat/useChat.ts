@@ -23,8 +23,8 @@ import { maybeAutoSpeak, refreshVoiceStatus } from '@/lib/voice';
 import type { ChatRequest, SlashCommand, StreamEvent, Todo, UploadResult, Usage } from '@/lib/types';
 
 const TURN_EVENTS = new Set<StreamEvent['type']>([
-  'turn_start', 'memory_recall', 'skills_suggested', 'step_start', 'text', 'reasoning', 'message', 'tool_call',
-  'approval_requested', 'approval', 'tool_result', 'compaction', 'error', 'done',
+  'turn_start', 'memory_recall', 'skills_suggested', 'step_start', 'snapshot', 'text', 'reasoning', 'message',
+  'tool_call', 'approval_requested', 'approval', 'tool_result', 'compaction', 'error', 'done',
 ]);
 
 export interface ChatCallbacks {
