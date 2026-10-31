@@ -7,7 +7,7 @@ import { useVoiceConversation } from '@/lib/conversation';
 import { cx, downloadText, safeFilename } from '@/lib/format';
 import { turnText } from '@/lib/turns';
 import type { Health, SessionSummary, SlashCommand } from '@/lib/types';
-import { enqueueSpeech, markStreamedSpeech, nextSpeechChunk } from '@/lib/voice';
+import { enqueueSpeech, markStreamedSpeech, nextSpeechChunk, speechText, stopSpeaking } from '@/lib/voice';
 import type { SessionActions } from '../AppShell';
 import { useToast } from '../Toaster';
 import { CenteredSpinner } from '../ui';
@@ -66,12 +66,18 @@ export default function ChatView(props: Props) {
     onError: toast.error,
   });
   const speechCursor = useRef<{ key: string | null; offset: number }>({ key: null, offset: 0 });
+  const speechMuted = useRef<string | null>(null);
+  const stopSpeech = useCallback(() => {
+    if (speechCursor.current.key) speechMuted.current = speechCursor.current.key;
+    stopSpeaking();
+  }, []);
 
   // Speak complete sentences while the reply is still streaming. This removes
   // the long wait between finishing a spoken turn and hearing the first word.
   useEffect(() => {
     if (!voice.enabled) {
       speechCursor.current = { key: null, offset: 0 };
+      speechMuted.current = null;
       return;
     }
     const live = chat.live;
@@ -80,22 +86,31 @@ export default function ChatView(props: Props) {
       const last = chat.items[chat.items.length - 1];
       if (last?.kind === 'assistant' && speechCursor.current.key === last.turn.key) turn = last.turn;
     }
-    if (!turn) return;
+    if (!turn) {
+      if (speechCursor.current.key) {
+        stopSpeaking();
+        speechCursor.current = { key: null, offset: 0 };
+        speechMuted.current = null;
+      }
+      return;
+    }
     if (speechCursor.current.key !== turn.key) {
       if (!live) return;
+      if (speechCursor.current.key) stopSpeaking();
       speechCursor.current = { key: turn.key, offset: 0 };
     }
-    const raw = turnText(turn);
+    if (speechMuted.current && speechMuted.current !== turn.key) speechMuted.current = null;
+    const raw = speechText(turnText(turn));
     if (!raw) return;
-    const fenceCount = (raw.match(/```/g) || []).length;
-    const safeLength = fenceCount % 2 === 1 ? raw.lastIndexOf('```') : raw.length;
-    if (safeLength <= 0) return;
-    const safe = raw.slice(0, safeLength);
+    if (speechMuted.current === turn.key) {
+      speechCursor.current.offset = raw.length;
+      return;
+    }
     markStreamedSpeech(turn.key);
-    let offset = Math.min(speechCursor.current.offset, safe.length);
-    const final = (!live || turn.status !== 'streaming') && safeLength === raw.length;
-    while (offset < safe.length) {
-      const part = nextSpeechChunk(safe.slice(offset), final);
+    let offset = Math.min(speechCursor.current.offset, raw.length);
+    const final = !live || turn.status !== 'streaming';
+    while (offset < raw.length) {
+      const part = nextSpeechChunk(raw.slice(offset), final);
       if (!part.text || part.consumed <= 0) break;
       offset += part.consumed;
       enqueueSpeech(turn.key, part.text, toast.error);
@@ -362,7 +377,10 @@ export default function ChatView(props: Props) {
             stopping={chat.stopping}
             commands={commands}
             onSend={(text, uploads) => chat.send({ text, uploads })}
-            onStop={chat.stop}
+            onStop={() => {
+              stopSpeech();
+              chat.stop();
+            }}
             onError={toast.error}
             autoFocusKey={`${sessionId ?? 'new'}-${newChatNonce}`}
             voiceSupported={voice.supported}

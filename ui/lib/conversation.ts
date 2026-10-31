@@ -5,7 +5,7 @@
 // floor back automatically. Push-to-talk is available as an alternative.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { getPlaybackState, setAutoSpeak, subscribePlayback } from './voice';
+import { getPlaybackState, setAutoSpeak, stopSpeaking, subscribePlayback } from './voice';
 
 export type VoicePhase = 'off' | 'listening' | 'thinking' | 'speaking' | 'error';
 
@@ -411,6 +411,7 @@ export function useVoiceConversation({ running, onUtterance, onError }: Options)
       setSettings(next);
       setError(null);
       if (next.enabled) setAutoSpeak(true);
+      else stopSpeaking();
       saveConversationSettings(next);
     },
     [],
