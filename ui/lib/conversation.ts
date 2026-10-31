@@ -5,7 +5,14 @@
 // floor back automatically. Push-to-talk is available as an alternative.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { getPlaybackState, setAutoSpeak, stopSpeaking, subscribePlayback } from './voice';
+import {
+  duckSpeech,
+  getPlaybackState,
+  getSpeakingText,
+  setAutoSpeak,
+  stopSpeaking,
+  subscribePlayback,
+} from './voice';
 
 export type VoicePhase = 'off' | 'listening' | 'thinking' | 'speaking' | 'error';
 
@@ -115,21 +122,37 @@ export function voiceInputSupported(): boolean {
   return !!recognitionCtor();
 }
 
+/** True when heard speech is probably Alita's own TTS output, not the user. */
+export function speechLooksLikeEcho(heard: string, spoken: string): boolean {
+  const normalise = (text: string) =>
+    text.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
+  const heardText = normalise(heard);
+  const spokenText = normalise(spoken);
+  if (!heardText || !spokenText) return false;
+  if (spokenText.includes(heardText)) return true;
+  const spokenWords = new Set(spokenText.split(' '));
+  const words = heardText.split(' ').filter(Boolean);
+  if (!words.length) return false;
+  const hits = words.filter((word) => spokenWords.has(word)).length;
+  return hits / words.length >= 0.7;
+}
+
 interface Options {
   running: boolean;
   onUtterance: (text: string) => void | Promise<void>;
+  onInterrupt?: () => void;
   onError?: (message: string) => void;
 }
 
-export function useVoiceConversation({ running, onUtterance, onError }: Options) {
+export function useVoiceConversation({ running, onUtterance, onInterrupt, onError }: Options) {
   const [supported, setSupported] = useState(false);
   const [settings, setSettings] = useState<ConversationSettings>(DEFAULTS);
   const [phase, setPhaseState] = useState<VoicePhase>('off');
   const [interim, setInterim] = useState('');
   const [error, setError] = useState<string | null>(null);
 
-  const optsRef = useRef({ running, onUtterance, onError });
-  optsRef.current = { running, onUtterance, onError };
+  const optsRef = useRef({ running, onUtterance, onInterrupt, onError });
+  optsRef.current = { running, onUtterance, onInterrupt, onError };
   const settingsRef = useRef<ConversationSettings>(DEFAULTS);
   const enabledRef = useRef(false);
   const runningRef = useRef(running);
@@ -143,8 +166,12 @@ export function useVoiceConversation({ running, onUtterance, onError }: Options)
   const sendingRef = useRef(false);
   const silenceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const restartTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const bargeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const speechStartedAt = useRef(0);
+  const bargeHeard = useRef(0);
+  const bargeTriggered = useRef(false);
   const apiRef = useRef<{
-    begin: (manual?: boolean) => void;
+    begin: (manual?: boolean, force?: boolean) => void;
     pause: () => void;
     result: (event: RecognitionEvent) => void;
     error: (event: RecognitionErrorEvent) => void;
@@ -159,13 +186,16 @@ export function useVoiceConversation({ running, onUtterance, onError }: Options)
   const clearTimers = useCallback(() => {
     if (silenceTimer.current) clearTimeout(silenceTimer.current);
     if (restartTimer.current) clearTimeout(restartTimer.current);
+    if (bargeTimer.current) clearTimeout(bargeTimer.current);
     silenceTimer.current = null;
     restartTimer.current = null;
+    bargeTimer.current = null;
   }, []);
 
   const resetTranscript = useCallback(() => {
     finalRef.current = '';
     interimRef.current = '';
+    bargeHeard.current = 0;
     setInterim('');
   }, []);
 
@@ -180,6 +210,8 @@ export function useVoiceConversation({ running, onUtterance, onError }: Options)
     }
     sendingRef.current = true;
     suppressRef.current = true;
+    bargeTriggered.current = false;
+    speechStartedAt.current = 0;
     try {
       recognitionRef.current?.abort();
     } catch {
@@ -202,15 +234,15 @@ export function useVoiceConversation({ running, onUtterance, onError }: Options)
   }, [clearTimers, resetTranscript, setPhase]);
 
   const begin = useCallback(
-    (manual = false) => {
+    (manual = false, force = false) => {
       const recognition = recognitionRef.current;
       if (!recognition || sendingRef.current) return;
       if (!enabledRef.current && !manual) return;
-      if (runningRef.current) return;
+      if (runningRef.current && !force) return;
       manualRef.current = manual;
       suppressRef.current = false;
       clearTimers();
-      resetTranscript();
+      if (phaseRef.current !== 'listening') resetTranscript();
       setError(null);
       recognition.lang = settingsRef.current.lang;
       setPhase('listening');
@@ -222,6 +254,18 @@ export function useVoiceConversation({ running, onUtterance, onError }: Options)
     },
     [clearTimers, resetTranscript, setPhase],
   );
+
+  const startRecognitionOnly = useCallback(() => {
+    const recognition = recognitionRef.current;
+    if (!recognition || sendingRef.current) return;
+    suppressRef.current = false;
+    recognition.lang = settingsRef.current.lang;
+    try {
+      recognition.start();
+    } catch {
+      /* already started */
+    }
+  }, []);
 
   const pause = useCallback(() => {
     clearTimers();
@@ -243,6 +287,50 @@ export function useVoiceConversation({ running, onUtterance, onError }: Options)
     }, settingsRef.current.silenceMs);
   }, [submit]);
 
+  const looksLikeEcho = useCallback(
+    (heard: string): boolean => speechLooksLikeEcho(heard, getSpeakingText()),
+    [],
+  );
+
+  const triggerBargeIn = useCallback(() => {
+    bargeTriggered.current = true;
+    bargeHeard.current = 0;
+    duckSpeech(0.2);
+    setPhase('listening');
+    startRecognitionOnly();
+    if (bargeTimer.current) clearTimeout(bargeTimer.current);
+    bargeTimer.current = setTimeout(() => {
+      bargeTimer.current = null;
+      stopSpeaking();
+      optsRef.current.onInterrupt?.();
+    }, 300);
+  }, [setPhase, startRecognitionOnly]);
+
+  const maybeBargeIn = useCallback(
+    (display: string): boolean => {
+      if (
+        !enabledRef.current ||
+        settingsRef.current.pushToTalk ||
+        bargeTriggered.current ||
+        sendingRef.current
+      ) {
+        return false;
+      }
+      const current = phaseRef.current;
+      if (current !== 'speaking' && current !== 'thinking') return false;
+      if (current === 'speaking' && Date.now() - speechStartedAt.current < 400) return false;
+      const text = display.trim();
+      if (text.length < 3 || looksLikeEcho(text)) return false;
+      if (text.length < 6) {
+        bargeHeard.current += 1;
+        if (bargeHeard.current < 2) return false;
+      }
+      triggerBargeIn();
+      return true;
+    },
+    [looksLikeEcho, triggerBargeIn],
+  );
+
   const result = useCallback(
     (event: RecognitionEvent) => {
       if (suppressRef.current || (!enabledRef.current && !manualRef.current)) return;
@@ -258,12 +346,16 @@ export function useVoiceConversation({ running, onUtterance, onError }: Options)
       interimRef.current = partial.trim();
       const display = `${finalRef.current} ${interimRef.current}`.trim();
       setInterim(display);
-      if (display) {
-        setPhase('listening');
+      if (!display) return;
+      if (maybeBargeIn(display)) {
         scheduleSubmit();
+        return;
       }
+      if (runningRef.current && !bargeTriggered.current) return;
+      setPhase('listening');
+      scheduleSubmit();
     },
-    [scheduleSubmit, setPhase],
+    [maybeBargeIn, scheduleSubmit, setPhase],
   );
 
   const recognitionError = useCallback(
@@ -368,12 +460,24 @@ export function useVoiceConversation({ running, onUtterance, onError }: Options)
   useEffect(() => {
     if (!supported) return;
     if (running) {
-      pause();
-      resetTranscript();
+      bargeTriggered.current = false;
+      bargeHeard.current = 0;
+      speechStartedAt.current = 0;
       setPhase('thinking');
+      if (enabledRef.current && !settingsRef.current.pushToTalk) {
+        startRecognitionOnly();
+      } else {
+        pause();
+        resetTranscript();
+      }
       return;
     }
     if (!enabledRef.current) return;
+    if (bargeTriggered.current) {
+      setPhase('listening');
+      startRecognitionOnly();
+      return;
+    }
     const timer = setTimeout(() => {
       if (getPlaybackState().key) {
         setPhase('speaking');
@@ -383,7 +487,7 @@ export function useVoiceConversation({ running, onUtterance, onError }: Options)
       }
     }, 350);
     return () => clearTimeout(timer);
-  }, [running, supported, pause, resetTranscript, setPhase, begin]);
+  }, [running, supported, pause, resetTranscript, setPhase, begin, startRecognitionOnly]);
 
   useEffect(() => {
     if (!supported) return;
@@ -391,9 +495,24 @@ export function useVoiceConversation({ running, onUtterance, onError }: Options)
       if (!enabledRef.current) return;
       const state = getPlaybackState();
       if (state.key) {
-        pause();
+        if (state.state === 'playing') {
+          speechStartedAt.current = Date.now();
+          bargeHeard.current = 0;
+        }
         setPhase(state.state === 'loading' ? 'thinking' : 'speaking');
-      } else if (!runningRef.current) {
+        if (settingsRef.current.pushToTalk) {
+          pause();
+        } else if (state.state === 'playing') {
+          startRecognitionOnly();
+        }
+        return;
+      }
+      if (bargeTriggered.current) {
+        setPhase('listening');
+        startRecognitionOnly();
+        return;
+      }
+      if (!runningRef.current) {
         setPhase('listening');
         begin(manualRef.current);
       }
@@ -401,7 +520,7 @@ export function useVoiceConversation({ running, onUtterance, onError }: Options)
     return () => {
       unsubscribe();
     };
-  }, [supported, pause, setPhase, begin]);
+  }, [supported, pause, setPhase, begin, startRecognitionOnly]);
 
   const update = useCallback(
     (patch: Partial<ConversationSettings>) => {
@@ -410,8 +529,13 @@ export function useVoiceConversation({ running, onUtterance, onError }: Options)
       enabledRef.current = next.enabled;
       setSettings(next);
       setError(null);
-      if (next.enabled) setAutoSpeak(true);
-      else stopSpeaking();
+      if (next.enabled) {
+        setAutoSpeak(true);
+        bargeTriggered.current = false;
+        speechStartedAt.current = 0;
+      } else {
+        stopSpeaking();
+      }
       saveConversationSettings(next);
     },
     [],
@@ -453,6 +577,9 @@ export function useVoiceConversation({ running, onUtterance, onError }: Options)
     start: begin,
     stop: () => {
       pause();
+      stopSpeaking();
+      bargeTriggered.current = false;
+      speechStartedAt.current = 0;
       resetTranscript();
       setPhase('off');
     },

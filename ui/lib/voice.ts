@@ -34,6 +34,7 @@ const IDLE = { key: null as string | null, state: 'idle' as PlayState };
 const playback = store(IDLE);
 let audio: HTMLAudioElement | null = null;
 let token = 0;
+let speakingText = '';
 let segmentDone: (() => void) | null = null;
 const streamedKeys = new Set<string>();
 const speechQueue: {
@@ -63,6 +64,7 @@ function stopBrowserSpeech() {
 
 export function stopSpeaking() {
   token++;
+  speakingText = '';
   speechQueue.runId++;
   speechQueue.key = null;
   speechQueue.items = [];
@@ -166,6 +168,16 @@ export function enqueueSpeech(key: string, text: string, onError?: (message: str
   if (!speechQueue.active) void runQueue(key, speechQueue.runId);
 }
 
+/** Text currently being spoken (used to reject microphone echo). */
+export function getSpeakingText(): string {
+  return speakingText;
+}
+
+/** Lower the current audio volume briefly for a responsive barge-in. */
+export function duckSpeech(volume: number = 0.2) {
+  if (audio) audio.volume = Math.min(1, Math.max(0, volume));
+}
+
 export function markStreamedSpeech(key: string) {
   streamedKeys.add(key);
   if (streamedKeys.size > 80) {
@@ -201,6 +213,7 @@ function playBrowserSegment(
     voices[0];
   if (chosen) utter.voice = chosen;
   utter.rate = clamp(status.settings?.speed ?? 1, 0.5, 2);
+  speakingText = text;
   return new Promise<boolean>((resolve) => {
     let settled = false;
     const finish = (ok: boolean) => {
@@ -237,6 +250,7 @@ async function playServerSegment(key: string, text: string, mine: number): Promi
   if (mine !== token) return false;
   const el = new Audio(api.withToken(prepared.url));
   audio = el;
+  speakingText = text;
   return new Promise<boolean>((resolve) => {
     let settled = false;
     const finish = (ok: boolean) => {
@@ -305,6 +319,7 @@ async function runQueue(key: string, runId: number) {
         speechQueue.key = null;
         speechQueue.items = [];
         speechQueue.onError = undefined;
+        speakingText = '';
         playback.set(IDLE);
       }
     }

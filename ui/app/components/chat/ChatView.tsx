@@ -58,13 +58,32 @@ export default function ChatView(props: Props) {
     toastInfo: toast.info,
   });
 
+  const chatSend = useRef(chat.send);
+  chatSend.current = chat.send;
+  const chatSession = useRef<string | null>(null);
+  chatSession.current = chat.sessionId || sessionId;
+  const pendingVoice = useRef<{ sessionId: string | null; text: string } | null>(null);
   const voice = useVoiceConversation({
     running: chat.running,
     onUtterance: (text) => {
-      void chat.send({ text });
+      if (chat.running) {
+        pendingVoice.current = { sessionId: chatSession.current, text };
+        if (chatSession.current) void api.interruptSession(chatSession.current);
+        return;
+      }
+      void chatSend.current({ text });
+    },
+    onInterrupt: () => {
+      if (chatSession.current) void api.interruptSession(chatSession.current);
     },
     onError: toast.error,
   });
+  useEffect(() => {
+    if (chat.running || !pendingVoice.current) return;
+    const pending = pendingVoice.current;
+    pendingVoice.current = null;
+    if (pending.sessionId === chatSession.current) void chatSend.current({ text: pending.text });
+  }, [chat.running]);
   const speechCursor = useRef<{ key: string | null; offset: number }>({ key: null, offset: 0 });
   const speechMuted = useRef<string | null>(null);
   const stopSpeech = useCallback(() => {

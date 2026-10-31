@@ -387,8 +387,9 @@ export default function VoiceSection({
                 <div className="min-w-0 flex-1">
                   <p className="text-[13px] font-semibold text-fg">Hands-free conversation</p>
                   <p className="mt-0.5 text-[11.5px] leading-relaxed text-muted">
-                    Speak naturally; a pause sends your turn. Alita answers aloud, then listens again. Microphone input uses
-                    your browser&apos;s speech recognition (Chrome or Edge) and needs localhost or HTTPS.
+                    Speak naturally; a pause sends your turn. Alita answers aloud, then listens again. Start talking while
+                    she is speaking to interrupt her. Microphone input uses your browser&apos;s speech recognition (Chrome
+                    or Edge) and needs localhost or HTTPS.
                   </p>
                 </div>
                 <Toggle
