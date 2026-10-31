@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import alita.api.server as server
+from alita.core.session import TurnRun
 from tests.conftest import tool_call
 
 
@@ -21,6 +22,45 @@ def sse_events(resp):
         if line.startswith("data: "):
             out.append(json.loads(line[6:]))
     return out
+
+
+async def test_turn_run_buffer_is_bounded_with_snapshot(monkeypatch):
+    monkeypatch.setenv("ALITA_TURN_EVENT_BUFFER", "100")
+    run = TurnRun("s1")
+    for _ in range(10_000):
+        await run.emit({"type": "text", "content": "x"})
+    await run.finish()
+
+    assert len(run.events) == 100
+    assert [e["seq"] for e in run.events] == list(range(9_900, 10_000))
+    assert run.snapshot is not None
+    assert run.snapshot["text"] == "x" * 9_900
+
+    late = [e async for e in run.subscribe(0)]
+    assert late[0]["type"] == "snapshot" and late[0]["seq"] == 9_899
+    assert late[0]["text"] == "x" * 9_900
+    assert [e["seq"] for e in late[1:]] == list(range(9_900, 10_000))
+
+    current = [e async for e in run.subscribe(9_950)]
+    assert all(e["type"] == "text" for e in current)
+    assert [e["seq"] for e in current] == list(range(9_950, 10_000))
+
+
+async def test_turn_run_snapshot_tracks_reasoning_and_step(monkeypatch):
+    monkeypatch.setenv("ALITA_TURN_EVENT_BUFFER", "10")
+    run = TurnRun("s2")
+    await run.emit({"type": "step_start", "step": 4})
+    await run.emit({"type": "reasoning", "content": "plan "})
+    for _ in range(12):
+        await run.emit({"type": "text", "content": "y"})
+    await run.finish()
+
+    assert run.snapshot is not None
+    assert run.snapshot["step"] == 4
+    assert run.snapshot["reasoning"] == "plan "
+    assert run.snapshot["text"].startswith("y")
+    first = [e async for e in run.subscribe(0)][0]
+    assert first["type"] == "snapshot" and first["reasoning"] == "plan " and first["step"] == 4
 
 
 def test_stream_creates_session_and_replays(client, agent):

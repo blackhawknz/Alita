@@ -26,14 +26,22 @@ from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from ..memory.sqlite_store import SQLiteStore
 from ..tools.todo_tool import TodoStore
+from . import config
 
 logger = logging.getLogger(__name__)
 
 _CACHE_SIZE = 64
+_DEFAULT_EVENT_BUFFER = 5000
 
 
 class TurnRun:
-    """Event buffer for one in-flight agent turn (supports re-attaching)."""
+    """Event buffer for one in-flight agent turn (supports re-attaching).
+
+    The buffer is bounded. When the oldest events are evicted their cumulative
+    text/reasoning and latest step are kept in ``snapshot``; late subscribers
+    receive that snapshot before the retained tail so the UI can replace the
+    accumulated text instead of showing a truncated reply.
+    """
 
     def __init__(self, session_id: str):
         self.id = uuid.uuid4().hex[:12]
@@ -43,11 +51,35 @@ class TurnRun:
         self.task: Optional[asyncio.Task] = None
         self.started_at = time.time()
         self._cond = asyncio.Condition()
+        self._next_seq = 0
+        self._buffer_limit = max(10, config.env_int("ALITA_TURN_EVENT_BUFFER", _DEFAULT_EVENT_BUFFER))
+        self.snapshot: Optional[Dict[str, Any]] = None
+        self._snapshot_text: List[str] = []
+        self._snapshot_reasoning: List[str] = []
+        self._snapshot_step = 0
+
+    def _evict(self, event: Dict[str, Any]) -> None:
+        kind = event.get("type")
+        if kind == "text":
+            self._snapshot_text.append(str(event.get("content") or ""))
+        elif kind == "reasoning":
+            self._snapshot_reasoning.append(str(event.get("content") or ""))
+        elif kind == "step_start":
+            self._snapshot_step = int(event.get("step") or 0)
+        self.snapshot = {
+            "type": "snapshot",
+            "text": "".join(self._snapshot_text),
+            "reasoning": "".join(self._snapshot_reasoning),
+            "step": self._snapshot_step,
+        }
 
     async def emit(self, event: Dict[str, Any]) -> None:
         async with self._cond:
-            event = {**event, "seq": len(self.events)}
+            event = {**event, "seq": self._next_seq}
+            self._next_seq += 1
             self.events.append(event)
+            while len(self.events) > self._buffer_limit:
+                self._evict(self.events.pop(0))
             self._cond.notify_all()
 
     async def finish(self) -> None:
@@ -56,16 +88,30 @@ class TurnRun:
             self._cond.notify_all()
 
     async def subscribe(self, after: int = 0) -> AsyncGenerator[Dict[str, Any], None]:
-        idx = max(0, after)
+        cursor = max(0, int(after))
+        snapshot_sent = False
         while True:
             async with self._cond:
-                await self._cond.wait_for(lambda: len(self.events) > idx or self.done)
-                batch = self.events[idx:]
-                idx = len(self.events)
+                await self._cond.wait_for(lambda: self._next_seq > cursor or self.done)
+                events = list(self.events)
+                next_seq = self._next_seq
                 finished = self.done
-            for ev in batch:
-                yield ev
-            if finished and idx >= len(self.events):
+
+            if not snapshot_sent and self.snapshot is not None:
+                first_retained = events[0]["seq"] if events else next_seq
+                if cursor < first_retained:
+                    snapshot_seq = first_retained - 1
+                    if cursor <= snapshot_seq:
+                        yield {**self.snapshot, "seq": snapshot_seq}
+                        cursor = snapshot_seq + 1
+                    snapshot_sent = True
+
+            batch = [ev for ev in events if ev["seq"] >= cursor]
+            if batch:
+                cursor = batch[-1]["seq"] + 1
+                for ev in batch:
+                    yield ev
+            if finished and cursor >= next_seq:
                 return
 
 
