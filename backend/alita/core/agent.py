@@ -54,9 +54,21 @@ logger = logging.getLogger(__name__)
 
 Emit = Callable[[Dict[str, Any]], Awaitable[None]]
 
-# Tools that are safe to run concurrently within one step.
-_PARALLEL_SAFE = {"browser", "http_request", "gmail", "session_search", "memory", "skill_view", "delegate_task"}
-_READONLY_FILE_ACTIONS = {"read", "list", "search", "list_checkpoints"}
+# Tools that are safe to run concurrently within one step. ``None`` means every
+# action of that tool is safe; otherwise only the listed read-only actions are.
+_PARALLEL_SAFE_ACTIONS: Dict[str, Optional[Set[str]]] = {
+    "browser": None,
+    "http_request": None,
+    "gmail": None,
+    "session_search": None,
+    "memory": None,
+    "skill_view": None,
+    "delegate_task": None,
+    "file_ops": {"read", "list", "search", "list_checkpoints"},
+    "database": {"query", "schema"},
+    "git": {"status", "diff", "log"},
+    "easy_diffusion": {"status", "models"},
+}
 
 TODO_TOOL_SCHEMA = {
     "name": "todo",
@@ -688,9 +700,10 @@ class AlitaAgent:
     # ─── Tool execution ───────────────────────────────────────────
 
     def _parallel_safe(self, name: str, params: Dict[str, Any]) -> bool:
-        if name in _PARALLEL_SAFE:
-            return True
-        return name == "file_ops" and params.get("action") in _READONLY_FILE_ACTIONS
+        if name not in _PARALLEL_SAFE_ACTIONS:
+            return False
+        actions = _PARALLEL_SAFE_ACTIONS[name]
+        return actions is None or params.get("action") in actions
 
     async def _execute_tool_calls(self, sess: Session, tool_calls: List[Dict[str, Any]], emit: Emit,
                                   guard: ToolGuardrails) -> None:
