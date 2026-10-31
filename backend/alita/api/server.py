@@ -978,6 +978,14 @@ async def run_job_now(job_id: str):
     return {"success": True, "job_id": job_id, "message": "Job started"}
 
 
+@app.post("/jobs/{job_id}/dry-run")
+async def dry_run_job(job_id: str):
+    result = await get_agent().scheduler_service.dry_run_job(job_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return result
+
+
 @app.get("/jobs/{job_id}/runs")
 async def list_job_runs(job_id: str, limit: int = Query(20, ge=1, le=200)):
     runs = get_agent().scheduler_store.list_runs(job_id=job_id, limit=limit)

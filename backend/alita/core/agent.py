@@ -507,6 +507,7 @@ class AlitaAgent:
         parent_id: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
         on_event: Optional[Emit] = None,
+        headless_approval: Optional[str] = None,
         **_: Any,
     ) -> Dict[str, Any]:
         """Run one turn to completion (non-streaming). Creates a session if needed."""
@@ -535,7 +536,7 @@ class AlitaAgent:
 
         async with sess.lock:
             await self._run_turn(sess, user_message, emit, session_instructions=system_message or "",
-                                 max_iterations=max_iterations)
+                                 max_iterations=max_iterations, headless_approval=headless_approval)
         return {
             "final_response": outcome.get("final_response", ""),
             "api_call_count": outcome.get("api_calls", 0),
@@ -570,6 +571,7 @@ class AlitaAgent:
         regenerate: bool = False,
         session_instructions: str = "",
         max_iterations: Optional[int] = None,
+        headless_approval: Optional[str] = None,
     ) -> None:
         token = current_session.set(sess)
         llm = self.llm  # a settings change mid-turn shouldn't swap providers under us
@@ -747,7 +749,8 @@ class AlitaAgent:
                     final_text = text
                     break
 
-                await self._execute_tool_calls(sess, tool_calls, emit, guard)
+                await self._execute_tool_calls(sess, tool_calls, emit, guard,
+                                               headless_approval=headless_approval)
                 tool_calls_total += len(tool_calls)
                 iteration += 1
                 if sess.interrupt_requested:
@@ -794,7 +797,8 @@ class AlitaAgent:
         return actions is None or params.get("action") in actions
 
     async def _execute_tool_calls(self, sess: Session, tool_calls: List[Dict[str, Any]], emit: Emit,
-                                  guard: ToolGuardrails) -> None:
+                                  guard: ToolGuardrails,
+                                  headless_approval: Optional[str] = None) -> None:
         prepared = []
         for tc in tool_calls:
             fn = tc.get("function") or {}
@@ -822,7 +826,8 @@ class AlitaAgent:
                 p["error"] = "Skipped: interrupted by user."
                 continue
             if sess.headless:
-                if self.settings.headless_approval != "allow":
+                approval_mode = headless_approval or self.settings.headless_approval
+                if approval_mode != "allow":
                     p["denied"] = True
                     p["error"] = (f"Denied: '{p['name']}' needs user approval ({decision.reason}), which isn't available "
                                   "in background runs. Use a non-destructive approach or report back.")

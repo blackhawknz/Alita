@@ -159,6 +159,85 @@ class SchedulerService:
         task.add_done_callback(self._tasks.discard)
         return job_id
 
+    async def dry_run_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Run a job prompt with approvals denied, without recording a real run."""
+        job = self.store.get_job(job_id)
+        if job is None:
+            return None
+        start_time = time.time()
+        sess = self.agent.sessions.create(
+            kind="dry-run",
+            title=f"Dry run: {job.name}",
+            metadata={"job_id": job_id, "dry_run": True},
+        )
+        timeout = getattr(self.agent.settings, "background_timeout", 120) or 120
+        try:
+            try:
+                result = await asyncio.wait_for(
+                    self.agent.run_conversation(
+                        job.prompt,
+                        session=sess,
+                        kind="dry-run",
+                        title=f"Dry run: {job.name}",
+                        metadata={"job_id": job_id, "dry_run": True},
+                        system_message=(
+                            "This is a dry run of an unattended scheduled job. Do not perform writes or deliver "
+                            "anything; explain what you would do and report any actions that would need approval."
+                        ),
+                        headless_approval="deny",
+                    ),
+                    timeout=float(timeout),
+                )
+            except asyncio.TimeoutError:
+                return {
+                    "success": False,
+                    "timed_out": True,
+                    "text": "",
+                    "tool_calls": [],
+                    "denied": [],
+                    "error": f"Dry run timed out after {timeout}s.",
+                    "duration_ms": int((time.time() - start_time) * 1000),
+                }
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Dry run for job %s failed: %s", job_id, exc)
+                return {
+                    "success": False,
+                    "timed_out": False,
+                    "text": "",
+                    "tool_calls": [],
+                    "denied": [],
+                    "error": str(exc),
+                    "duration_ms": int((time.time() - start_time) * 1000),
+                }
+
+            tool_calls = []
+            denied = []
+            for entry in result.get("tool_trace", []):
+                output = entry.get("output_result")
+                was_denied = isinstance(output, dict) and bool(output.get("denied"))
+                tool_calls.append({
+                    "tool_name": entry.get("tool_name", ""),
+                    "success": bool(entry.get("success", True)),
+                    "denied": was_denied,
+                })
+                if was_denied:
+                    denied.append(entry.get("tool_name", ""))
+            error = result.get("error")
+            return {
+                "success": not result.get("interrupted") and not error,
+                "timed_out": False,
+                "text": result.get("final_response", "") or "",
+                "tool_calls": tool_calls,
+                "denied": denied,
+                "error": error,
+                "duration_ms": int((time.time() - start_time) * 1000),
+            }
+        finally:
+            try:
+                self.agent.sessions.delete(sess.id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Could not clean up dry-run session %s: %s", sess.id, exc)
+
     # ─── APScheduler registration ──────────────────────────────────
 
     def _register_aps_job(self, job: ScheduledJob) -> None:
