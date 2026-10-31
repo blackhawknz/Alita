@@ -130,13 +130,22 @@ def run_process(
 
     Output is captured through temporary files rather than pipes: when a
     process is killed its pipes are closed before ``communicate()`` can drain
-    them, which used to discard all partial output. Blocking -- call through
-    ``asyncio.to_thread`` from async code.
+    them, which used to discard all partial output.
+
+    ``PYTHONUNBUFFERED=1`` is set so Python children do not lose their stdout
+    buffer when killed. Other runtimes (Node, Go, Rust) mostly write unbuffered
+    to files already; this guarantee is Python-specific.
+
+    Blocking -- call through ``asyncio.to_thread`` from async code.
     """
+    child_env = os.environ.copy()
+    if env:
+        child_env.update(env)
+    child_env.setdefault("PYTHONUNBUFFERED", "1")
     popen_kwargs: Dict[str, Any] = {
         "stdin": subprocess.DEVNULL,
         "cwd": cwd,
-        "env": env,
+        "env": child_env,
     }
     if IS_WINDOWS:
         popen_kwargs["creationflags"] = _CREATE_NO_WINDOW | _CREATE_NEW_PROCESS_GROUP
