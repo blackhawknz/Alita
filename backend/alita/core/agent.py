@@ -366,6 +366,34 @@ class AlitaAgent:
         task.add_done_callback(self._background.discard)
         return task
 
+    async def _persist_usage(
+        self,
+        *,
+        session_id: str,
+        job_id: Optional[str],
+        source: str,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        cached_tokens: int,
+        estimated: bool,
+    ) -> None:
+        """Write a usage event off the turn's critical path."""
+        try:
+            await asyncio.to_thread(
+                self.sqlite.record_usage,
+                session_id=session_id,
+                job_id=job_id,
+                source=source,
+                model=model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cached_tokens=cached_tokens,
+                estimated=estimated,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("could not persist token usage for %s: %s", session_id, exc)
+
     async def shutdown(self) -> None:
         for sess in self.sessions.running():
             self.interrupt(sess.id)
@@ -593,6 +621,8 @@ class AlitaAgent:
                 reasoning_parts: List[str] = []
                 tool_calls: List[Dict[str, Any]] = []
                 usage: Dict[str, Any] = {}
+                usage_seen = False
+                response_model = getattr(llm, "model", "") or self.llm_model_name
                 scrubber = ThinkBlockScrubber()
                 await emit({"type": "step_start", "step": iteration + 1})
                 try:
@@ -601,6 +631,8 @@ class AlitaAgent:
                         if sess.interrupt_requested:
                             interrupted = True
                             break
+                        if "model" in ev:
+                            response_model = str(ev["model"] or response_model)
                         if "content" in ev:
                             safe = scrubber.feed(ev["content"])
                             if safe:
@@ -613,6 +645,7 @@ class AlitaAgent:
                             tool_calls = ev["tool_calls"]
                         elif "usage" in ev:
                             usage = ev["usage"]
+                            usage_seen = True
                     tail = scrubber.flush()
                     if tail:
                         text_parts.append(tail)
@@ -641,14 +674,28 @@ class AlitaAgent:
                     self.sessions.append(sess, assistant)
                     await emit({"type": "message", "message_id": assistant.get("_id"), "role": "assistant"})
 
-                ctx_tokens = usage.get("prompt_tokens") or payload_tokens
+                measured_prompt = int(usage.get("prompt_tokens") or 0)
+                ctx_tokens = measured_prompt or payload_tokens
+                completion_tokens = int(usage.get("completion_tokens") or 0)
+                cached_tokens = int(usage.get("cached_tokens") or 0)
                 sess.last_usage = {
                     "context_tokens": ctx_tokens,
-                    "completion_tokens": usage.get("completion_tokens", 0),
-                    "cached_tokens": usage.get("cached_tokens", 0),
+                    "completion_tokens": completion_tokens,
+                    "cached_tokens": cached_tokens,
                     "context_window": self.context_window,
                 }
                 await emit({"type": "usage", **sess.last_usage})
+                if usage_seen and (ctx_tokens or completion_tokens or cached_tokens):
+                    self.spawn(self._persist_usage(
+                        session_id=sess.id,
+                        job_id=(sess.metadata or {}).get("job_id"),
+                        source=sess.kind,
+                        model=response_model,
+                        prompt_tokens=ctx_tokens,
+                        completion_tokens=completion_tokens,
+                        cached_tokens=cached_tokens,
+                        estimated=not bool(measured_prompt),
+                    ))
 
                 if error:
                     await emit({"type": "error", "message": error})

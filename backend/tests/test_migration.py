@@ -49,7 +49,7 @@ def test_v1_database_is_cleaned_up(tmp_path):
         ("user", "How do I bake sourdough bread?"), ("assistant", "Start with a starter.")]
     hits = store.search_messages("sourdough")
     assert len(hits) == 1 and hits[0]["session_id"] == "chat1"
-    assert store.query_one("PRAGMA user_version")["user_version"] == 2
+    assert store.query_one("PRAGMA user_version")["user_version"] == 3
     store.close()
     # Re-opening is idempotent.
     again = SQLiteStore(path)

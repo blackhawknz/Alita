@@ -216,6 +216,7 @@ class FallbackProvider(LLMProvider):
 
     async def chat_stream(self, messages, tools=None, temperature=None, max_tokens=None):
         emitted = False
+        yield {"model": self.primary.model}
         try:
             async for event in self.primary.chat_stream(
                 messages, tools=tools, temperature=temperature, max_tokens=max_tokens
@@ -232,6 +233,7 @@ class FallbackProvider(LLMProvider):
                 self.primary.provider_id, exc,
             )
         fallback = self._get_fallback()
+        yield {"model": getattr(fallback, "model", self.fallback_id)}
         async for event in fallback.chat_stream(
             messages, tools=tools, temperature=temperature, max_tokens=max_tokens
         ):
