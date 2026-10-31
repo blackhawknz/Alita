@@ -138,6 +138,7 @@ class AgentSettings:
         # need approval: "deny" (default) or "allow".
         self.headless_approval = _env("ALITA_HEADLESS_APPROVAL", "deny").lower()
         self.tool_result_max_chars = env_int("ALITA_TOOL_RESULT_MAX_CHARS", 24000)
+        self.background_timeout = env_int("ALITA_BACKGROUND_TIMEOUT", 120)
 
 
 # ─── .env management ──────────────────────────────────────────────────

@@ -8,6 +8,7 @@ and the memory recall injection.
 
 import asyncio
 import json
+import logging
 
 import pytest
 
@@ -307,6 +308,57 @@ async def test_llm_error_surfaces_as_event(agent):
     events = await collect(agent, sess, "hi")
     assert any(e["type"] == "error" and "invalid key" in e["message"] for e in events)
     assert events[-1]["error"]
+
+
+async def test_background_task_failure_is_logged(agent, caplog):
+    async def fail():
+        raise RuntimeError("background exploded")
+
+    with caplog.at_level(logging.WARNING, logger="alita.core.agent"):
+        task = agent.spawn(fail(), name="test-failure")
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)
+
+    assert "background task failed" in caplog.text
+    assert "test-failure" in caplog.text
+    assert "background exploded" in caplog.text
+    assert task not in agent._background
+
+
+async def test_background_task_timeout_is_logged(agent, caplog):
+    cancelled = asyncio.Event()
+
+    async def slow():
+        try:
+            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    agent.settings.background_timeout = 0.05
+    with caplog.at_level(logging.WARNING, logger="alita.core.agent"):
+        task = agent.spawn(slow(), name="test-timeout")
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)
+
+    assert cancelled.is_set()
+    assert "background task timed out and was cancelled" in caplog.text
+    assert "test-timeout" in caplog.text
+    assert task not in agent._background
+
+
+async def test_background_success_is_quiet(agent, caplog):
+    async def quick():
+        return "ok"
+
+    with caplog.at_level(logging.WARNING, logger="alita.core.agent"):
+        task = agent.spawn(quick(), name="test-success")
+        await task
+        await asyncio.sleep(0)
+
+    assert "background task failed" not in caplog.text
+    assert "background task timed out" not in caplog.text
+    assert task not in agent._background
 
 
 def test_repair_history_adds_missing_results_and_drops_orphans():
