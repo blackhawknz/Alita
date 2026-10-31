@@ -204,8 +204,8 @@ class SQLiteStore:
             ]:
                 if col not in conv_cols:
                     conn.execute(f"ALTER TABLE conversations ADD COLUMN {col} {ddl}")
-            # Scoped / fiction memories (Fortitude and other story worlds).
-            # ``scope`` namespaces a world (e.g. "fortitude:<worldId>"),
+            # Scoped / fiction memories.
+            # ``scope`` namespaces a world (e.g. "story:<worldId>"),
             # ``external_ref`` makes external writes idempotent, and
             # ``fiction`` marks memories that must never be treated as
             # real-world facts by recall, de-duplication or extraction.
