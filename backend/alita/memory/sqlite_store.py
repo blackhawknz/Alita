@@ -24,7 +24,7 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SESSION_KINDS = ("chat", "job", "subagent", "kanban")
 
@@ -108,6 +108,37 @@ class SQLiteStore:
             cur = conn.execute(sql, params)
             return cur.lastrowid if cur.lastrowid else cur.rowcount
 
+    def record_usage(
+        self,
+        *,
+        session_id: Optional[str],
+        job_id: Optional[str],
+        source: str,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int = 0,
+        cached_tokens: int = 0,
+        estimated: bool = False,
+    ) -> int:
+        """Persist one provider call's token usage. Call from a worker thread."""
+        with self.tx() as conn:
+            cur = conn.execute(
+                "INSERT INTO usage_events "
+                "(session_id, job_id, source, model, prompt_tokens, completion_tokens, "
+                " cached_tokens, estimated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    job_id,
+                    source,
+                    model,
+                    int(prompt_tokens or 0),
+                    int(completion_tokens or 0),
+                    int(cached_tokens or 0),
+                    1 if estimated else 0,
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
     def close(self) -> None:
         with self._lock:
             try:
@@ -180,6 +211,20 @@ class SQLiteStore:
                 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
                     content, tokenize='porter unicode61'
                 );
+                CREATE TABLE IF NOT EXISTS usage_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT,
+                    job_id TEXT,
+                    source TEXT NOT NULL,
+                    model TEXT,
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                    completion_tokens INTEGER NOT NULL DEFAULT 0,
+                    cached_tokens INTEGER NOT NULL DEFAULT 0,
+                    estimated INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_events(created_at);
+                CREATE INDEX IF NOT EXISTS idx_usage_session ON usage_events(session_id);
                 """
             )
             # Columns added in schema v2 (idempotent for old databases).
@@ -279,6 +324,7 @@ class SQLiteStore:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             if version < 2:
                 self._migrate_v2(conn)
+            if version < SCHEMA_VERSION:
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def _migrate_v2(self, conn: sqlite3.Connection) -> None:

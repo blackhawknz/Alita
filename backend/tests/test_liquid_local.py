@@ -73,8 +73,12 @@ def test_fallback_on_missing_key():
             events.append(event)
 
     asyncio.run(run())
-    assert events[0]["content"] == "offline answer"
+    contents = [e for e in events if "content" in e]
+    assert contents[0]["content"] == "offline answer"
     assert events[-1]["usage"]["completion_tokens"] == 2
+    models = [e["model"] for e in events if "model" in e]
+    assert models[0] == "online-model"
+    assert models[-1] == "LiquidAI/LFM2.5-1.2B-Instruct-GGUF"
 
 
 def test_fallback_not_used_for_bad_request():

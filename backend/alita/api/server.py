@@ -17,7 +17,7 @@ import mimetypes
 import os
 import re
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
@@ -251,6 +251,84 @@ async def stats():
         "tools": len(agent.tool_registry.list_names()),
         "running": [s.to_dict() for s in agent.sessions.running()],
     }
+
+
+def _usage_bound(value: Optional[str], label: str) -> Optional[str]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid {label} timestamp; use ISO 8601.") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+@app.get("/usage/summary")
+async def usage_summary(
+    since: Optional[str] = Query(None, description="ISO 8601 lower bound"),
+    until: Optional[str] = Query(None, description="ISO 8601 upper bound"),
+):
+    since_sql = _usage_bound(since, "since")
+    until_sql = _usage_bound(until, "until")
+    clauses: List[str] = []
+    params: List[Any] = []
+    if since_sql:
+        clauses.append("created_at >= ?")
+        params.append(since_sql)
+    if until_sql:
+        clauses.append("created_at <= ?")
+        params.append(until_sql)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    db = get_agent().sqlite
+    total = db.query_one(
+        "SELECT COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens, "
+        "COALESCE(SUM(completion_tokens), 0) AS completion_tokens, "
+        "COALESCE(SUM(cached_tokens), 0) AS cached_tokens, "
+        "COUNT(*) AS runs FROM usage_events" + where,
+        params,
+    ) or {}
+    by_day = db.query(
+        "SELECT date(created_at) AS date, "
+        "COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens, "
+        "COALESCE(SUM(completion_tokens), 0) AS completion_tokens, "
+        "COALESCE(SUM(cached_tokens), 0) AS cached_tokens, "
+        "COUNT(*) AS runs FROM usage_events" + where +
+        " GROUP BY date(created_at) ORDER BY date(created_at)",
+        params,
+    )
+    by_model = db.query(
+        "SELECT COALESCE(model, '') AS model, "
+        "COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens, "
+        "COALESCE(SUM(completion_tokens), 0) AS completion_tokens, "
+        "COALESCE(SUM(cached_tokens), 0) AS cached_tokens, "
+        "COUNT(*) AS runs FROM usage_events" + where +
+        " GROUP BY model ORDER BY prompt_tokens DESC",
+        params,
+    )
+    return {
+        "since": since_sql,
+        "until": until_sql,
+        "total": {
+            "prompt_tokens": int(total.get("prompt_tokens") or 0),
+            "completion_tokens": int(total.get("completion_tokens") or 0),
+            "cached_tokens": int(total.get("cached_tokens") or 0),
+            "runs": int(total.get("runs") or 0),
+        },
+        "by_day": by_day,
+        "by_model": by_model,
+    }
+
+
+@app.get("/usage/sessions/{session_id}")
+async def usage_for_session(session_id: str, limit: int = Query(500, ge=1, le=5000)):
+    rows = get_agent().sqlite.query(
+        "SELECT * FROM usage_events WHERE session_id = ? "
+        "ORDER BY created_at, id LIMIT ?",
+        (session_id, int(limit)),
+    )
+    return {"session_id": session_id, "events": rows, "count": len(rows)}
 
 
 # ─── Chat ─────────────────────────────────────────────────────────────
