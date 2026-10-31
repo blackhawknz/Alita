@@ -1,5 +1,7 @@
 """Tests for core memory blocks, the long-term memory store and memory tools."""
 
+import sqlite3
+
 import pytest
 
 from alita.memory.core_memory import CoreMemory, CoreMemoryError
@@ -65,6 +67,74 @@ async def test_longterm_update_and_delete(db):
     assert await lt.delete(mid)
     assert await lt.search("Munich") == []
     assert not await lt.delete(mid)
+
+
+async def test_fts_tracks_soft_delete_and_reactivation(db):
+    lt = LongTermMemory(db, vectors=None)
+    mid = (await lt.add("User lives in Berlin", category="fact"))["id"]
+
+    def fts_count() -> int:
+        return db.query_one("SELECT COUNT(*) AS n FROM memories_fts")["n"]
+
+    def active_count() -> int:
+        return db.query_one("SELECT COUNT(*) AS n FROM memories WHERE active = 1")["n"]
+
+    assert fts_count() == active_count() == 1
+
+    assert await lt.delete(mid)
+    assert await lt.search("Berlin") == []
+    assert fts_count() == active_count() == 0
+
+    db.execute("UPDATE memories SET active = 1 WHERE id = ?", (mid,))
+    assert fts_count() == active_count() == 1
+    assert (await lt.search("Berlin"))[0]["id"] == mid
+
+    db.execute("UPDATE memories SET active = 0 WHERE id = ?", (mid,))
+    assert fts_count() == active_count() == 0
+
+
+async def test_fts_content_update_keeps_one_row(db):
+    lt = LongTermMemory(db, vectors=None)
+    mid = (await lt.add("User lives in Berlin", category="fact"))["id"]
+    assert await lt.update(mid, content="User lives in Munich")
+
+    rows = db.query("SELECT rowid FROM memories_fts")
+    assert [int(r["rowid"]) for r in rows] == [mid]
+    assert (await lt.search("Munich"))[0]["id"] == mid
+    assert await lt.search("Berlin") == []
+
+
+async def test_startup_repair_rebuilds_active_only_index(tmp_path):
+    path = tmp_path / "repair.db"
+    store = SQLiteStore(str(path))
+    lt = LongTermMemory(store, vectors=None)
+    keep = (await lt.add("User keeps this memory", category="fact"))["id"]
+    drop = (await lt.add("User dropped this memory", category="fact"))["id"]
+    store.close()
+
+    raw = sqlite3.connect(str(path))
+    try:
+        # Simulate a pre-trigger database: soft-delete without touching FTS,
+        # remove an active row from FTS, and leave a phantom row behind.
+        raw.execute("DROP TRIGGER IF EXISTS memories_active_au")
+        raw.execute("UPDATE memories SET active = 0 WHERE id = ?", (drop,))
+        raw.execute("DELETE FROM memories_fts WHERE rowid = ?", (keep,))
+        raw.execute("INSERT INTO memories_fts(rowid, content) VALUES (9999, 'ghost')")
+        raw.commit()
+    finally:
+        raw.close()
+
+    repaired = SQLiteStore(str(path))
+    try:
+        fts = repaired.query("SELECT rowid FROM memories_fts ORDER BY rowid")
+        active = repaired.query("SELECT id FROM memories WHERE active = 1 ORDER BY id")
+        assert [int(r["rowid"]) for r in fts] == [int(r["id"]) for r in active] == [keep]
+
+        lt2 = LongTermMemory(repaired, vectors=None)
+        assert (await lt2.search("keeps"))[0]["id"] == keep
+        assert await lt2.search("dropped") == []
+    finally:
+        repaired.close()
 
 
 def test_fts_query_is_safe():

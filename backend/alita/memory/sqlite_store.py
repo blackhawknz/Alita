@@ -232,7 +232,49 @@ class SQLiteStore:
                 CREATE INDEX IF NOT EXISTS idx_conv_session ON conversations(session_id, id);
                 CREATE INDEX IF NOT EXISTS idx_sessions_kind ON sessions(kind, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_memories_active ON memories(active, category);
+
+                CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories
+                WHEN new.active = 1
+                BEGIN
+                    INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories
+                BEGIN
+                    DELETE FROM memories_fts WHERE rowid = old.id;
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE OF content ON memories
+                WHEN new.active = 1
+                BEGIN
+                    DELETE FROM memories_fts WHERE rowid = old.id;
+                    INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS memories_active_au AFTER UPDATE OF active ON memories
+                WHEN old.active <> new.active
+                BEGIN
+                    DELETE FROM memories_fts WHERE rowid = old.id;
+                    INSERT INTO memories_fts(rowid, content)
+                        SELECT new.id, new.content WHERE new.active = 1;
+                END;
                 """
+            )
+            # Repair FTS drift left by pre-trigger code paths. The invariant is
+            # exactly one index row per *active* memory.
+            conn.execute(
+                "DELETE FROM memories_fts "
+                "WHERE rowid NOT IN (SELECT id FROM memories WHERE active = 1)"
+            )
+            conn.execute(
+                "DELETE FROM memories_fts "
+                "WHERE rowid IN (SELECT rowid FROM memories_fts GROUP BY rowid HAVING COUNT(*) > 1)"
+            )
+            conn.execute(
+                "INSERT INTO memories_fts(rowid, content) "
+                "SELECT m.id, m.content FROM memories m "
+                "WHERE m.active = 1 "
+                "AND NOT EXISTS (SELECT 1 FROM memories_fts f WHERE f.rowid = m.id)"
             )
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             if version < 2:

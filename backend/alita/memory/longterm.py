@@ -133,7 +133,6 @@ class LongTermMemory:
                 (content, category, importance, source_session),
             )
             mem_id = cur.lastrowid
-            conn.execute("INSERT INTO memories_fts(rowid, content) VALUES (?, ?)", (mem_id, content))
         if self.vectors:
             await self.vectors.aupsert(MEMORY_COLLECTION, str(mem_id), content, {"category": category})
         return {"status": "added", "id": mem_id}
@@ -157,9 +156,6 @@ class LongTermMemory:
                 "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (new_content, new_category, new_importance, int(memory_id)),
             )
-            if new_content != row["content"]:
-                conn.execute("DELETE FROM memories_fts WHERE rowid = ?", (int(memory_id),))
-                conn.execute("INSERT INTO memories_fts(rowid, content) VALUES (?, ?)", (int(memory_id), new_content))
         if self.vectors and new_content != row["content"]:
             await self.vectors.aupsert(MEMORY_COLLECTION, str(memory_id), new_content, {"category": new_category})
         return True
@@ -168,7 +164,6 @@ class LongTermMemory:
         with self.db.tx() as conn:
             cur = conn.execute("UPDATE memories SET active = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND active = 1",
                                (int(memory_id),))
-            conn.execute("DELETE FROM memories_fts WHERE rowid = ?", (int(memory_id),))
             ok = cur.rowcount > 0
         if ok and self.vectors:
             await self.vectors.adelete(MEMORY_COLLECTION, str(memory_id))
@@ -325,7 +320,6 @@ class LongTermMemory:
                 (content, category, importance, scope, external_ref),
             )
             mem_id = cur.lastrowid
-            conn.execute("INSERT INTO memories_fts(rowid, content) VALUES (?, ?)", (mem_id, content))
         if self.vectors:
             await self.vectors.aupsert(MEMORY_COLLECTION, str(mem_id), content, {"category": category, "fiction": 1, "scope": scope})
         return {"status": "added", "id": mem_id}
@@ -363,7 +357,6 @@ class LongTermMemory:
         with self.db.tx() as conn:
             # external_ref is cleared so a reset world can reuse the same refs.
             conn.execute(f"UPDATE memories SET active = 0, external_ref = NULL, updated_at = CURRENT_TIMESTAMP WHERE id IN ({marks})", ids)
-            conn.execute(f"DELETE FROM memories_fts WHERE rowid IN ({marks})", ids)
         if self.vectors:
             for mem_id in ids:
                 await self.vectors.adelete(MEMORY_COLLECTION, str(mem_id))
