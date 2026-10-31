@@ -141,8 +141,14 @@ class GitTools:
         result = await asyncio.to_thread(
             run_process, cmd, cwd=str(work_dir), timeout=timeout, env=env, max_output=10 * _MAX_OUTPUT
         )
-        if result.get("error") == "timeout":
-            return {"success": False, "error": f"git command timed out after {timeout}s."}
+        if result.get("timed_out") or result.get("error") == "timeout":
+            return {
+                "success": False,
+                "timed_out": True,
+                "error": f"git command timed out after {timeout}s.",
+                "stdout": result.get("stdout", ""),
+                "stderr": result.get("stderr", ""),
+            }
         if result.get("error", "").startswith("Executable not found"):
             return {"success": False, "error": "git not found -- is git installed and on PATH?"}
 
