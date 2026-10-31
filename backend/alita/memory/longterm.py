@@ -289,7 +289,7 @@ class LongTermMemory:
 
     # ─── Scoped (fiction) memories ────────────────────────────────
     #
-    # Used by story worlds such as Fortitude. Every scoped memory is marked
+    # Scoped story/fiction memories. Every scoped memory is marked
     # ``fiction=1``: it can be recalled at home (labelled as fiction), but it
     # is never merged with, updated by, or mistaken for a real-world memory.
 

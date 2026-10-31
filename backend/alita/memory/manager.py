@@ -43,8 +43,7 @@ projects, environment/setup details, decisions, and commitments. Do NOT store:
 transient task details, things only relevant to this one request, generic
 knowledge, the assistant's own opinions, or anything already captured below.
 Events, people and places from stories, games or simulations the user and
-Alita share (for example the Fortitude station) are FICTION: never store them
-as real-world facts.
+Alita share are FICTION: never store them as real-world facts.
 
 Write each memory as one short, self-contained, third-person statement
 (e.g. "User's name is Sam", "User prefers concise answers with code first").
@@ -136,8 +135,8 @@ class MemoryManager:
         lines = [line(m) for m in items]
         note = ""
         if any(m.get("fiction") for m in items):
-            note = ("Entries marked FICTION happened inside a story world you take part in (e.g. Fortitude, "
-                    "where you are Queen). They are your memories of that story — never real-world facts.\n")
+            note = ("Entries marked FICTION happened inside a story world you take part in (e.g. an "
+                    "interactive fiction session). They are your memories of that story — never real-world facts.\n")
         return (
             "<recalled_memories>\n"
             "Possibly relevant long-term memories (auto-retrieved; may be outdated — "
