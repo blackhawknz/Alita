@@ -171,6 +171,28 @@ async def test_terminal_runs_in_workspace(tmp_path):
     mgr.destroy_all()
 
 
+async def test_terminal_passes_through_timed_out(tmp_path, monkeypatch):
+    mgr = SandboxManager(workspace_dir=str(tmp_path))
+    mgr._docker_available = False
+    term = TerminalTool(mgr)
+
+    async def fake_run(command, timeout, work_dir):
+        return {
+            "success": False,
+            "stdout": "partial",
+            "stderr": "",
+            "exit_code": -1,
+            "timed_out": True,
+            "error": "Command timed out after 2s; partial output below.",
+        }
+
+    monkeypatch.setattr(term, "_run", fake_run)
+    res = await term.execute(command="whatever", timeout=2)
+    assert res["timed_out"] is True
+    assert res["stdout"] == "partial"
+    assert "timed out" in res["error"].lower()
+
+
 async def test_terminal_does_not_block_event_loop(tmp_path):
     mgr = SandboxManager(workspace_dir=str(tmp_path))
     mgr._docker_available = False

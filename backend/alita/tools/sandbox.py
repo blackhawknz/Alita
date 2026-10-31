@@ -20,6 +20,7 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -127,13 +128,13 @@ def run_process(
 ) -> Dict[str, Any]:
     """Run ``args`` (never via a shell) with a timeout and process-tree kill.
 
-    Blocking -- call through ``asyncio.to_thread`` from async code. Returns a
-    dict with stdout, stderr, exit_code, success and (on timeout) error.
+    Output is captured through temporary files rather than pipes: when a
+    process is killed its pipes are closed before ``communicate()`` can drain
+    them, which used to discard all partial output. Blocking -- call through
+    ``asyncio.to_thread`` from async code.
     """
     popen_kwargs: Dict[str, Any] = {
         "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.PIPE,
         "cwd": cwd,
         "env": env,
     }
@@ -143,45 +144,61 @@ def run_process(
         popen_kwargs["start_new_session"] = True
 
     try:
-        proc = subprocess.Popen(args, **popen_kwargs)
+        with tempfile.TemporaryDirectory(
+            prefix="alita-process-", ignore_cleanup_errors=True
+        ) as tmp:
+            out_path = Path(tmp) / "stdout"
+            err_path = Path(tmp) / "stderr"
+            with open(out_path, "wb") as out_file, open(err_path, "wb") as err_file:
+                proc = subprocess.Popen(args, stdout=out_file, stderr=err_file, **popen_kwargs)
+                timed_out = False
+                try:
+                    proc.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    kill_process_tree(proc)
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:  # noqa: BLE001 - the tree may still be dying
+                        pass
+            out = out_path.read_bytes()
+            err = err_path.read_bytes()
     except FileNotFoundError as exc:
         return {
             "stdout": "",
             "stderr": str(exc),
             "exit_code": -1,
             "success": False,
+            "timed_out": False,
             "error": f"Executable not found: {args[0]!r}",
         }
     except OSError as exc:
-        return {"stdout": "", "stderr": str(exc), "exit_code": -1, "success": False, "error": str(exc)}
-
-    timed_out = False
-    try:
-        out, err = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        kill_process_tree(proc)
-        try:
-            out, err = proc.communicate(timeout=5)
-        except Exception:  # noqa: BLE001 - grandchildren may still hold the pipes
-            out, err = b"", b""
+        return {
+            "stdout": "",
+            "stderr": str(exc),
+            "exit_code": -1,
+            "success": False,
+            "timed_out": False,
+            "error": str(exc),
+        }
 
     stdout = cap_output(_decode(out), max_output)
     stderr = cap_output(_decode(err), max_output)
     if timed_out:
-        note = f"Command timed out after {timeout}s and was killed."
         return {
             "stdout": stdout,
-            "stderr": (stderr + "\n" + note).strip(),
+            "stderr": stderr,
             "exit_code": -1,
             "success": False,
-            "error": "timeout",
+            "timed_out": True,
+            "error": f"Command timed out after {timeout:g}s; partial output below.",
         }
     return {
         "stdout": stdout,
         "stderr": stderr,
         "exit_code": proc.returncode,
         "success": proc.returncode == 0,
+        "timed_out": False,
     }
 
 
@@ -477,7 +494,8 @@ class SandboxManager:
         result = run_process(docker_args, timeout=timeout + 10)
         stderr = result.get("stderr") or ""
         if result.get("exit_code") == 137 and not result.get("error"):
-            result["error"] = "timeout"
+            result["error"] = f"Command timed out after {timeout}s; partial output below."
+            result["timed_out"] = True
             result["stderr"] = (stderr + f"\nCommand timed out after {timeout}s and was killed.").strip()
         if "No such container" in stderr or "is not running" in stderr:
             result["sandbox_lost"] = True

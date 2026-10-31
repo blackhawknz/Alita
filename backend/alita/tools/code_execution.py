@@ -198,8 +198,9 @@ class CodeExecutionTool:
                 "stderr": stderr,
                 "output": stdout if stdout else stderr,
             }
-            if result.get("error") == "timeout":
-                out["error"] = f"Timed out after {timeout_s}s."
+            if result.get("timed_out") or result.get("error") == "timeout":
+                out["timed_out"] = True
+                out["error"] = result.get("error") or f"Timed out after {timeout_s}s."
             elif result.get("error"):
                 out["error"] = result["error"]
             return out

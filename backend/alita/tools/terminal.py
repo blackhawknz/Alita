@@ -92,6 +92,7 @@ class TerminalTool:
             "stderr": result.get("stderr", ""),
             "exit_code": result.get("exit_code", -1),
             "duration_ms": int((time.time() - start_time) * 1000),
+            "timed_out": bool(result.get("timed_out", False)),
         }
         if result.get("error"):
             out["error"] = result["error"]

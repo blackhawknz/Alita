@@ -3,9 +3,11 @@ Tests for SandboxManager: work_dir validation, isolation classification, and
 that work_dir is threaded as a real cwd (never interpolated into the shell).
 """
 
+import sys
+
 import pytest
 
-from alita.tools.sandbox import SandboxManager
+from alita.tools.sandbox import SandboxManager, run_process
 
 
 # ─── _validate_work_dir ───────────────────────────────────────────
@@ -69,6 +71,18 @@ def test_is_isolated_other_tools_safe_by_default():
     mgr._docker_available = False
     assert mgr.is_isolated("file_ops") is True
     assert mgr.is_isolated("memory") is True
+
+
+# ─── timeout partial output ───────────────────────────────────────
+
+
+def test_run_process_returns_partial_output_on_timeout():
+    script = "print('a', flush=True); import time; time.sleep(30); print('b', flush=True)"
+    result = run_process([sys.executable, "-c", script], timeout=2, max_output=10_000)
+    assert result["timed_out"] is True
+    assert result["success"] is False
+    assert "a" in result["stdout"]
+    assert "timed out" in result["error"].lower()
 
 
 # ─── execute threads work_dir, rejects traversal ──────────────────
