@@ -8,6 +8,7 @@ with a stubbed agent.
 
 import asyncio
 import sqlite3
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
@@ -307,6 +308,60 @@ async def test_service_remove_job(tmp_path):
     await service.stop()
 
 
+async def test_service_dry_run_denies_writes_without_recording(tmp_path):
+    store = SchedulerStore(db_path=str(tmp_path / "dry.db"))
+    agent = MagicMock()
+    agent.settings.background_timeout = 5
+    agent.sessions.create.return_value = SimpleNamespace(id="dry-session")
+    agent.run_conversation = AsyncMock(return_value={
+        "final_response": "I would write the file, but approval is denied in a dry run.",
+        "interrupted": False,
+        "error": None,
+        "tool_trace": [{
+            "tool_name": "file_ops",
+            "success": False,
+            "output_result": {"success": False, "denied": True},
+        }],
+    })
+    service = SchedulerService(agent, store)
+    job = store.create_job(name="Dry", prompt="write a file", cron_expr="0 9 * * *")
+
+    result = await service.dry_run_job(job.id)
+
+    assert result is not None
+    assert result["success"] is True
+    assert result["denied"] == ["file_ops"]
+    assert result["tool_calls"][0]["denied"] is True
+    assert result["timed_out"] is False
+    assert store.get_job(job.id).run_count == 0
+    assert store.get_job(job.id).last_run_at == ""
+    assert store.list_runs(job_id=job.id) == []
+    assert agent.run_conversation.call_args.kwargs["headless_approval"] == "deny"
+    agent.sessions.delete.assert_called_once_with("dry-session")
+
+
+async def test_service_dry_run_timeout_does_not_record(tmp_path):
+    store = SchedulerStore(db_path=str(tmp_path / "dry_timeout.db"))
+    agent = MagicMock()
+    agent.settings.background_timeout = 0.05
+    agent.sessions.create.return_value = SimpleNamespace(id="dry-session")
+
+    async def slow(*args, **kwargs):
+        await asyncio.sleep(5)
+        return {}
+
+    agent.run_conversation = slow
+    service = SchedulerService(agent, store)
+    job = store.create_job(name="Slow", prompt="do something", cron_expr="0 9 * * *")
+
+    result = await service.dry_run_job(job.id)
+
+    assert result is not None and result["timed_out"] is True
+    assert result["success"] is False
+    assert store.get_job(job.id).run_count == 0
+    agent.sessions.delete.assert_called_once_with("dry-session")
+
+
 def test_service_invalid_cron_does_not_crash(tmp_path):
     """An invalid cron expression should be logged and skipped, not crash."""
     store = SchedulerStore(db_path=str(tmp_path / "svc_bad.db"))
@@ -417,6 +472,23 @@ def test_api_run_job_now(stub_agent_jobs):
     r = client.post(f"/jobs/{job_id}/run")
     assert r.status_code == 200
     assert r.json()["success"] is True
+
+
+def test_api_dry_run_job(stub_agent_jobs):
+    client = TestClient(app)
+    create = client.post("/jobs", json={"name": "Dry", "prompt": "x", "cron_expr": "* * * * *"})
+    job_id = create.json()["job"]["id"]
+    stub_agent_jobs.scheduler_service.dry_run_job = AsyncMock(return_value={
+        "success": True, "timed_out": False, "text": "Would need approval.",
+        "tool_calls": [{"tool_name": "file_ops", "success": False, "denied": True}],
+        "denied": ["file_ops"], "duration_ms": 12,
+    })
+
+    response = client.post(f"/jobs/{job_id}/dry-run")
+
+    assert response.status_code == 200
+    assert response.json()["denied"] == ["file_ops"]
+    assert response.json()["success"] is True
 
 
 def test_api_run_job_not_found(stub_agent_jobs):
