@@ -176,6 +176,47 @@ async def test_patch_lf_old_string_matches_crlf_file(fops):
     assert f.read_bytes() == b"x\r\ny\r\nc\r\n"
 
 
+async def test_patch_fuzzy_whitespace_match(fops):
+    f = fops.workspace / "fuzzy.py"
+    f.write_text("def foo():\n    return 1\n", encoding="utf-8")
+    res = await fops.execute(
+        action="patch",
+        path="fuzzy.py",
+        old_string="def foo():\n  return 1",
+        new_string="def foo():\n    return 2",
+    )
+    assert res["success"] is True and res["fuzzy"] is True
+    assert f.read_text(encoding="utf-8") == "def foo():\n    return 2\n"
+
+
+async def test_patch_fuzzy_refuses_ambiguous_match(fops):
+    f = fops.workspace / "ambiguous.txt"
+    f.write_text("foo    bar\nfoo\tbar\n", encoding="utf-8")
+    res = await fops.execute(action="patch", path="ambiguous.txt", old_string="foo bar", new_string="baz")
+    assert res["success"] is False
+    assert res["matches"] == 2
+    assert f.read_text(encoding="utf-8") == "foo    bar\nfoo\tbar\n"
+
+
+async def test_patch_reports_closest_region(fops):
+    f = fops.workspace / "close.txt"
+    f.write_text("alpha\nbeta\ngamma\ndelta\n", encoding="utf-8")
+    res = await fops.execute(action="patch", path="close.txt", old_string="betta", new_string="x")
+    assert res["success"] is False
+    assert res["matches"] == 0
+    assert res["closest"]["line"] == 2
+    assert "beta" in res["closest"]["text"]
+    assert "hint" in res
+
+
+async def test_patch_crlf_new_string_is_not_double_converted(fops):
+    f = fops.workspace / "no-double.txt"
+    f.write_bytes(b"a\r\nb\r\nc\r\n")
+    res = await fops.execute(action="patch", path="no-double.txt", old_string="a\nb", new_string="x\r\ny")
+    assert res["success"] is True
+    assert f.read_bytes() == b"x\r\ny\r\nc\r\n"
+
+
 # ─── Read paging ──────────────────────────────────────────────────
 
 
