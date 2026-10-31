@@ -1,0 +1,48 @@
+services:
+  # Alita backend API (agent runtime, memory, skills, tools)
+  alita-backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: alita-backend
+    ports:
+      - "127.0.0.1:8080:8080"
+    env_file:
+      - path: ./backend/.env
+        required: false
+    environment:
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      - EASY_DIFFUSION_URL=${EASY_DIFFUSION_URL:-http://host.docker.internal:9000}
+      - ALITA_HOME=/data
+      - ALITA_WORKSPACE=/workspace
+      # Inside the container the agent's shell is already isolated.
+      - ALITA_ALLOW_HOST_EXEC=${ALITA_ALLOW_HOST_EXEC:-true}
+      # Containers must bind all interfaces to be reachable via the port
+      # mapping; the mapping above only exposes it on the host's loopback.
+      - ALITA_HOST=0.0.0.0
+      - ALITA_ALLOW_INSECURE_BIND=true
+      - ALITA_CORS_ORIGINS=http://localhost:3001,http://127.0.0.1:3001
+    volumes:
+      - alita_data:/data
+      - alita_workspace:/workspace
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # Alita web UI (Next.js) — proxies /api/* to the backend
+  alita-ui:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
+      args:
+        ALITA_API_URL: http://alita-backend:8080
+    container_name: alita-ui
+    ports:
+      - "127.0.0.1:3001:3000"
+    depends_on:
+      - alita-backend
+    restart: unless-stopped
+
+volumes:
+  alita_data:
+  alita_workspace:

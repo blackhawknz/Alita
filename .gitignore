@@ -1,0 +1,43 @@
+# Dependencies
+node_modules/
+backend/venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Secrets / environment
+.env
+backend/.env
+client_secret*.json
+*gmail_token*.json
+
+# Build
+ui/.next/
+ui/out/
+ui/tsconfig.tsbuildinfo
+
+# Runtime data
+backend/workspace/
+backend/data/
+outputs/
+Dashboards/
+.alita_checkpoints/
+.sandboxes/
+.backup-*/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Tooling
+.pytest_cache/
+.vscode/
+.idea/
+.claude/settings.local.json
+*.swp
+*.swo
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

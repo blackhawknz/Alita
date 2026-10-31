@@ -1,0 +1,23 @@
+{
+  "servers": {
+    "filesystem": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/Desktop"],
+      "env": {}
+    },
+    "fetch": {
+      "transport": "stdio",
+      "command": "uvx",
+      "args": ["mcp-server-fetch"]
+    },
+    "remote-example": {
+      "transport": "sse",
+      "url": "http://localhost:8081/sse",
+      "headers": {
+        "Authorization": "Bearer your-token-here"
+      },
+      "timeout": 30
+    }
+  }
+}
