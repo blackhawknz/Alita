@@ -388,7 +388,11 @@ class ApprovalPolicy:
             preview = code.strip().split("\n")[0][:120]
             return ApprovalDecision(
                 needs_approval=True,
-                reason=f"execute_code contains destructive pattern ({label}): {preview!r}",
+                reason=(
+                    "This runs code directly on your machine, outside the sandbox, with "
+                    "your full user permissions. execute_code contains destructive "
+                    f"pattern ({label}): {preview!r}"
+                ),
                 severity="danger",
             )
         return ApprovalDecision(needs_approval=False)

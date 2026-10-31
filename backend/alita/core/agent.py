@@ -269,7 +269,8 @@ class AlitaAgent:
                  ["web", "research"]))
         reg(Tool("http_request", "HTTP API calls", self.http_request.definition, self.http_request.execute,
                  ["web", "network"]))
-        reg(Tool("execute_code", "Run code snippets", self.code_execution.definition, self.code_execution.execute,
+        reg(Tool("execute_code", "Run code snippets (unsandboxed on host)",
+                 self.code_execution.definition, self.code_execution.execute,
                  ["coding", "execution", "host_exec"]))
         reg(Tool("git", "Git operations", self.git_tools.definition, self.git_tools.execute, ["git", "coding"]))
         reg(Tool("database", "SQLite queries", self.database_tool.definition, self.database_tool.execute,
