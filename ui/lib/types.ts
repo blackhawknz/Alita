@@ -537,6 +537,7 @@ export interface ScheduledJob {
   description: string;
   prompt: string;
   cron_expr: string;
+  timezone: string;
   enabled: boolean;
   last_run_at: string;
   next_run_at: string;

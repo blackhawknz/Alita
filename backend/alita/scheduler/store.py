@@ -37,6 +37,7 @@ class ScheduledJob:
     run_count: int = 0
     created_at: str = ""
     updated_at: str = ""
+    timezone: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -45,6 +46,7 @@ class ScheduledJob:
             "description": self.description,
             "prompt": self.prompt,
             "cron_expr": self.cron_expr,
+            "timezone": self.timezone,
             "enabled": self.enabled,
             "last_run_at": self.last_run_at,
             "next_run_at": self.next_run_at,
@@ -119,6 +121,7 @@ class SchedulerStore:
                     description TEXT NOT NULL DEFAULT '',
                     prompt TEXT NOT NULL,
                     cron_expr TEXT NOT NULL,
+                    timezone TEXT DEFAULT '',
                     enabled BOOLEAN DEFAULT 1,
                     last_run_at TEXT DEFAULT '',
                     next_run_at TEXT DEFAULT '',
@@ -144,19 +147,22 @@ class SchedulerStore:
                 CREATE INDEX IF NOT EXISTS idx_job_runs_job ON job_runs(job_id);
                 CREATE INDEX IF NOT EXISTS idx_job_runs_started ON job_runs(started_at);
             """)
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(scheduled_jobs)")}
+            if "timezone" not in columns:
+                conn.execute("ALTER TABLE scheduled_jobs ADD COLUMN timezone TEXT DEFAULT ''")
 
     # ─── Jobs ──────────────────────────────────────────────────────
 
     def create_job(self, name: str, prompt: str, cron_expr: str,
-                   description: str = "", enabled: bool = True) -> ScheduledJob:
+                   description: str = "", enabled: bool = True, timezone: str = "") -> ScheduledJob:
         job_id = uuid.uuid4().hex[:12]
         now = datetime.utcnow().isoformat()
         with self._get_conn() as conn:
             conn.execute(
                 """INSERT INTO scheduled_jobs
-                   (id, name, description, prompt, cron_expr, enabled, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (job_id, name, description, prompt, cron_expr, enabled, now, now),
+                   (id, name, description, prompt, cron_expr, timezone, enabled, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (job_id, name, description, prompt, cron_expr, timezone, enabled, now, now),
             )
         return self.get_job(job_id)  # type: ignore[return-value]
 
@@ -175,7 +181,7 @@ class SchedulerStore:
         return [self._row_to_job(r) for r in rows]
 
     def update_job(self, job_id: str, **fields) -> Optional[ScheduledJob]:
-        allowed = {"name", "description", "prompt", "cron_expr", "enabled"}
+        allowed = {"name", "description", "prompt", "cron_expr", "enabled", "timezone"}
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
             return self.get_job(job_id)
@@ -220,6 +226,7 @@ class SchedulerStore:
             run_count=row["run_count"],
             created_at=row["created_at"] or "",
             updated_at=row["updated_at"] or "",
+            timezone=row["timezone"] or "",
         )
 
     # ─── Runs ──────────────────────────────────────────────────────

@@ -22,14 +22,21 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, tzinfo
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.jobstores.memory import MemoryJobStore
 
+from ..core import config
 from .store import SchedulerStore, ScheduledJob
+
+try:  # APScheduler already depends on tzlocal; keep a stdlib fallback.
+    from tzlocal import get_localzone
+except Exception:  # noqa: BLE001
+    get_localzone = None
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +65,7 @@ class SchedulerService:
 
         self._scheduler = AsyncIOScheduler(
             jobstores={"default": MemoryJobStore()},
-            timezone="UTC",
+            timezone=self.resolve_timezone(),
         )
         self._scheduler.start()
         self._started = True
@@ -87,14 +94,38 @@ class SchedulerService:
     # ─── Job management ─────────────────────────────────────────────
 
     @staticmethod
-    def validate_cron(cron_expr: str) -> None:
-        """Raise ValueError for an invalid 5-field cron expression."""
-        CronTrigger.from_crontab(cron_expr, timezone="UTC")
+    def resolve_timezone(name: Optional[str] = None) -> tzinfo:
+        """Resolve an explicit/configured timezone, else the host's local zone."""
+        raw = (name or config.timezone_name() or "").strip()
+        if raw:
+            try:
+                return ZoneInfo(raw)
+            except ZoneInfoNotFoundError as exc:
+                raise ValueError(f"Unknown timezone: {raw}") from exc
+        if get_localzone is not None:
+            try:
+                return get_localzone()
+            except Exception:  # noqa: BLE001
+                pass
+        return datetime.now().astimezone().tzinfo
+
+    @staticmethod
+    def validate_timezone(name: str) -> str:
+        """Validate an IANA name; empty means host local time."""
+        if not name:
+            return ""
+        SchedulerService.resolve_timezone(name)
+        return name
+
+    @staticmethod
+    def validate_cron(cron_expr: str, timezone: Optional[str] = None) -> None:
+        """Raise ValueError for an invalid 5-field cron expression or timezone."""
+        CronTrigger.from_crontab(cron_expr, timezone=SchedulerService.resolve_timezone(timezone))
 
     def add_job(self, name: str, prompt: str, cron_expr: str,
-                description: str = "", enabled: bool = True) -> ScheduledJob:
+                description: str = "", enabled: bool = True, timezone: str = "") -> ScheduledJob:
         """Create a new scheduled job and register it with APScheduler."""
-        job = self.store.create_job(name, prompt, cron_expr, description, enabled)
+        job = self.store.create_job(name, prompt, cron_expr, description, enabled, timezone)
         if enabled:
             self._register_aps_job(job)
         return job
@@ -134,7 +165,7 @@ class SchedulerService:
         if self._scheduler is None or not self._started:
             return
         try:
-            trigger = CronTrigger.from_crontab(job.cron_expr, timezone="UTC")
+            trigger = CronTrigger.from_crontab(job.cron_expr, timezone=self.resolve_timezone(job.timezone))
         except ValueError as exc:
             logger.warning("Invalid cron expression %r for job %s: %s", job.cron_expr, job.id, exc)
             return
