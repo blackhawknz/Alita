@@ -143,6 +143,22 @@ def test_execute_code_with_rm_gated():
     assert d.severity == "danger"
 
 
+def test_execute_code_approval_warns_unsandboxed():
+    p = ApprovalPolicy(mode="auto")
+    d = p.classify("execute_code", {"code": "import shutil; shutil.rmtree('build')"})
+    assert d.needs_approval is True
+    assert "outside the sandbox" in d.reason
+    assert "full user permissions" in d.reason
+
+
+def test_execute_code_schema_warns_unsandboxed():
+    from alita.tools.code_execution import CodeExecutionTool
+
+    description = CodeExecutionTool.definition["description"]
+    assert "outside the sandbox" in description
+    assert "full user permissions" in description
+
+
 def test_execute_code_benign_allowed():
     p = ApprovalPolicy(mode="auto")
     d = p.classify("execute_code", {"code": "print('hello')"})
