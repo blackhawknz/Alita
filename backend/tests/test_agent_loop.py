@@ -61,6 +61,41 @@ async def test_multi_tool_step_keeps_every_result(agent):
     assert fresh.todos.list()[0].title == "a"
 
 
+@pytest.mark.parametrize(
+    "name,action,expected",
+    [
+        ("browser", None, True),
+        ("http_request", None, True),
+        ("gmail", None, True),
+        ("session_search", None, True),
+        ("memory", None, True),
+        ("skill_view", None, True),
+        ("delegate_task", None, True),
+        ("file_ops", "read", True),
+        ("file_ops", "list_checkpoints", True),
+        ("file_ops", "write", False),
+        ("database", "query", True),
+        ("database", "schema", True),
+        ("database", "execute", False),
+        ("git", "status", True),
+        ("git", "diff", True),
+        ("git", "log", True),
+        ("git", "commit", False),
+        ("easy_diffusion", "status", True),
+        ("easy_diffusion", "models", True),
+        ("easy_diffusion", "generate", False),
+        ("terminal", None, False),
+        ("execute_code", None, False),
+        ("todo", None, False),
+        ("skill_manage", None, False),
+        ("unknown_tool", "read", False),
+    ],
+)
+def test_parallel_safe_table(agent, name, action, expected):
+    params = {"action": action} if action is not None else {}
+    assert agent._parallel_safe(name, params) is expected
+
+
 async def test_sessions_are_isolated(agent):
     agent.llm.script = [{"content": "one"}, {"content": "two"}]
     s1 = agent.sessions.create(kind="chat")
