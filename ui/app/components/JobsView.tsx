@@ -19,6 +19,35 @@ const CRON_PRESETS = [
 
 const fmt = (ts: string) => (ts ? shortDateTime(parseUtc(ts)) : '—');
 
+const FALLBACK_TIMEZONES = [
+  'UTC',
+  'Pacific/Auckland',
+  'Australia/Sydney',
+  'Asia/Tokyo',
+  'Asia/Singapore',
+  'Europe/London',
+  'Europe/Berlin',
+  'America/New_York',
+  'America/Chicago',
+  'America/Denver',
+  'America/Los_Angeles',
+];
+
+function browserTimezone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  } catch {
+    return 'UTC';
+  }
+}
+
+function timezoneOptions(): string[] {
+  const intl = Intl as unknown as { supportedValuesOf?: (key: string) => string[] };
+  const supported = intl.supportedValuesOf?.('timeZone') || FALLBACK_TIMEZONES;
+  const current = browserTimezone();
+  return supported.includes(current) ? supported : [current, ...supported];
+}
+
 function RunRow({ run }: { run: JobRun }) {
   const [open, setOpen] = useState(false);
   const Icon = run.status === 'completed' ? CircleCheck : run.status === 'failed' ? CircleX : LoaderCircle;
@@ -147,12 +176,23 @@ export default function JobsView() {
     }
   };
 
+  const handleTimezone = async (job: ScheduledJob, timezone: string) => {
+    setJobs((prev) => prev.map((j) => (j.id === job.id ? { ...j, timezone } : j)));
+    try {
+      await api.updateJob(job.id, { timezone });
+      load();
+    } catch (e) {
+      toast.error(api.errorMessage(e));
+      load();
+    }
+  };
+
   return (
     <div className="flex h-full flex-col">
       <PageHeader
         title="Jobs"
         icon={<Clock className="h-4 w-4" />}
-        subtitle={`${jobs.length} job${jobs.length !== 1 ? 's' : ''} · cron-scheduled agent runs (UTC)`}
+        subtitle={`${jobs.length} job${jobs.length !== 1 ? 's' : ''} · cron-scheduled agent runs`}
         actions={
           <>
             <button className="btn-primary" onClick={() => setShowCreate(true)}>
@@ -190,7 +230,7 @@ export default function JobsView() {
                       <button className="min-w-0 flex-1 text-left" onClick={() => toggleExpand(job.id)} aria-expanded={open}>
                         <p className={cx('truncate text-[13.5px] font-medium', job.enabled ? 'text-fg' : 'text-muted')}>{job.name}</p>
                         <p className="mt-0.5 truncate text-[11px] text-muted">
-                          <code className="font-mono text-fg-2">{job.cron_expr}</code> · {job.run_count} run{job.run_count !== 1 ? 's' : ''} · last {fmt(job.last_run_at)}
+                          <code className="font-mono text-fg-2">{job.cron_expr}</code> · {job.timezone || 'host local'} · {job.run_count} run{job.run_count !== 1 ? 's' : ''} · last {fmt(job.last_run_at)}
                           {job.enabled && job.next_run_at ? ` · next ${fmt(job.next_run_at)}` : ''}
                         </p>
                       </button>
@@ -211,6 +251,22 @@ export default function JobsView() {
                           <span className="text-[10.5px] font-semibold uppercase tracking-wider text-muted-2">Prompt</span>
                           <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-bg/70 p-2.5 font-mono text-xs text-fg-2">{job.prompt}</pre>
                         </div>
+                        <label className="flex flex-wrap items-center gap-2 text-xs text-muted">
+                          <span className="text-[10.5px] font-semibold uppercase tracking-wider text-muted-2">Timezone</span>
+                          <select
+                            value={job.timezone}
+                            onChange={(e) => handleTimezone(job, e.target.value)}
+                            className="input max-w-xs py-1 text-xs"
+                            aria-label={`Timezone for ${job.name}`}
+                          >
+                            <option value="">Host local ({browserTimezone()})</option>
+                            {timezoneOptions().map((zone) => (
+                              <option key={zone} value={zone}>
+                                {zone}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
                         <div>
                           <span className="text-[10.5px] font-semibold uppercase tracking-wider text-muted-2">Recent runs</span>
                           {!runs[job.id] ? (
@@ -238,9 +294,9 @@ export default function JobsView() {
       {showCreate && (
         <CreateJobModal
           onClose={() => setShowCreate(false)}
-          onCreate={async (name, prompt, cronExpr, description) => {
+          onCreate={async (name, prompt, cronExpr, description, timezone) => {
             try {
-              const job = await api.createJob({ name, prompt, cron_expr: cronExpr, description });
+              const job = await api.createJob({ name, prompt, cron_expr: cronExpr, description, timezone });
               setJobs((prev) => [job, ...prev]);
               setShowCreate(false);
               toast.success('Job created');
@@ -259,19 +315,21 @@ function CreateJobModal({
   onCreate,
 }: {
   onClose: () => void;
-  onCreate: (name: string, prompt: string, cronExpr: string, description: string) => Promise<void>;
+  onCreate: (name: string, prompt: string, cronExpr: string, description: string, timezone: string) => Promise<void>;
 }) {
   const [name, setName] = useState('');
   const [prompt, setPrompt] = useState('');
   const [cronExpr, setCronExpr] = useState('0 9 * * *');
   const [description, setDescription] = useState('');
+  const [timezone, setTimezone] = useState(browserTimezone);
   const [saving, setSaving] = useState(false);
+  const zones = timezoneOptions();
   const valid = name.trim() && prompt.trim() && cronExpr.trim();
 
   const submit = async () => {
     if (!valid) return;
     setSaving(true);
-    await onCreate(name.trim(), prompt.trim(), cronExpr.trim(), description.trim());
+    await onCreate(name.trim(), prompt.trim(), cronExpr.trim(), description.trim(), timezone);
     setSaving(false);
   };
 
@@ -318,7 +376,7 @@ function CreateJobModal({
         </div>
         <div>
           <label className="label" htmlFor="job-cron">
-            Schedule (cron, UTC)
+            Schedule (cron)
           </label>
           <input id="job-cron" value={cronExpr} onChange={(e) => setCronExpr(e.target.value)} className="input font-mono" />
           <div className="mt-2 flex flex-wrap gap-1.5">
@@ -335,7 +393,20 @@ function CreateJobModal({
               </button>
             ))}
           </div>
-          <p className="hint">minute hour day-of-month month day-of-week. Times are UTC.</p>
+          <p className="hint">minute hour day-of-month month day-of-week.</p>
+        </div>
+        <div>
+          <label className="label" htmlFor="job-timezone">
+            Timezone
+          </label>
+          <select id="job-timezone" value={timezone} onChange={(e) => setTimezone(e.target.value)} className="input">
+            {zones.map((zone) => (
+              <option key={zone} value={zone}>
+                {zone}
+              </option>
+            ))}
+          </select>
+          <p className="hint">Defaults to this browser&apos;s timezone. Next runs are shown in your local time.</p>
         </div>
       </div>
     </Modal>

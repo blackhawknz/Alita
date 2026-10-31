@@ -7,7 +7,9 @@ with a stubbed agent.
 """
 
 import asyncio
+import sqlite3
 from unittest.mock import AsyncMock, MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -60,6 +62,68 @@ def test_delete_job(store):
     assert store.delete_job(job.id) is True
     assert store.get_job(job.id) is None
     assert store.delete_job(job.id) is False
+
+
+def test_job_timezone_round_trip(store):
+    job = store.create_job(
+        name="Auckland", prompt="x", cron_expr="0 9 * * *", timezone="Pacific/Auckland"
+    )
+    assert job.timezone == "Pacific/Auckland"
+    assert store.get_job(job.id).timezone == "Pacific/Auckland"
+    updated = store.update_job(job.id, timezone="Europe/London")
+    assert updated.timezone == "Europe/London"
+
+
+def test_store_migrates_old_jobs_table_without_timezone(tmp_path):
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE scheduled_jobs (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            prompt TEXT NOT NULL,
+            cron_expr TEXT NOT NULL,
+            enabled BOOLEAN DEFAULT 1,
+            last_run_at TEXT DEFAULT '',
+            next_run_at TEXT DEFAULT '',
+            run_count INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        INSERT INTO scheduled_jobs (id, name, prompt, cron_expr)
+        VALUES ('old1', 'Old', 'x', '* * * * *');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = SchedulerStore(db_path=str(path))
+    job = store.get_job("old1")
+    assert job is not None and job.timezone == ""
+
+
+def test_service_resolves_timezones():
+    assert SchedulerService.resolve_timezone("Pacific/Auckland") == ZoneInfo("Pacific/Auckland")
+    assert SchedulerService.resolve_timezone(None) is not None
+    with pytest.raises(ValueError):
+        SchedulerService.resolve_timezone("Mars/Olympus")
+
+
+async def test_service_registers_job_in_its_timezone(tmp_path):
+    store = SchedulerStore(db_path=str(tmp_path / "svc_tz.db"))
+    agent = MagicMock()
+    agent.run_conversation = AsyncMock()
+    service = SchedulerService(agent, store)
+    service.start()
+    job = service.add_job(
+        name="NZ", prompt="x", cron_expr="0 9 * * *", timezone="Pacific/Auckland"
+    )
+    aps = service._scheduler.get_job(f"alita_job_{job.id}")
+    assert aps is not None
+    assert str(aps.trigger.timezone) == "Pacific/Auckland"
+    await service.stop()
 
 
 def test_mark_job_run_increments_count(store):
@@ -292,15 +356,30 @@ def test_api_list_jobs_empty(stub_agent_jobs):
 
 def test_api_create_and_get_job(stub_agent_jobs):
     client = TestClient(app)
-    r = client.post("/jobs", json={"name": "Daily Report", "prompt": "Give me a report", "cron_expr": "0 9 * * *"})
+    r = client.post("/jobs", json={
+        "name": "Daily Report", "prompt": "Give me a report",
+        "cron_expr": "0 9 * * *", "timezone": "Pacific/Auckland",
+    })
     assert r.status_code == 200
     job = r.json()["job"]
     assert job["name"] == "Daily Report"
     assert job["cron_expr"] == "0 9 * * *"
+    assert job["timezone"] == "Pacific/Auckland"
 
     r2 = client.get(f"/jobs/{job['id']}")
     assert r2.status_code == 200
     assert r2.json()["job"]["name"] == "Daily Report"
+    assert r2.json()["job"]["timezone"] == "Pacific/Auckland"
+
+
+def test_api_rejects_unknown_timezone(stub_agent_jobs):
+    client = TestClient(app)
+    r = client.post("/jobs", json={
+        "name": "Bad zone", "prompt": "x", "cron_expr": "0 9 * * *",
+        "timezone": "Mars/Olympus",
+    })
+    assert r.status_code == 400
+    assert "timezone" in r.json()["detail"].lower()
 
 
 def test_api_get_job_not_found(stub_agent_jobs):
@@ -313,10 +392,11 @@ def test_api_update_job(stub_agent_jobs):
     create = client.post("/jobs", json={"name": "Old", "prompt": "x", "cron_expr": "* * * * *"})
     job_id = create.json()["job"]["id"]
 
-    r = client.patch(f"/jobs/{job_id}", json={"name": "New Name", "enabled": False})
+    r = client.patch(f"/jobs/{job_id}", json={"name": "New Name", "enabled": False, "timezone": "Europe/London"})
     assert r.status_code == 200
     assert r.json()["job"]["name"] == "New Name"
     assert r.json()["job"]["enabled"] is False
+    assert r.json()["job"]["timezone"] == "Europe/London"
 
 
 def test_api_delete_job(stub_agent_jobs):

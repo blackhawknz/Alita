@@ -818,6 +818,7 @@ class JobCreate(BaseModel):
     prompt: str
     cron_expr: str
     enabled: bool = True
+    timezone: str = ""
 
 
 class JobUpdate(BaseModel):
@@ -826,14 +827,23 @@ class JobUpdate(BaseModel):
     prompt: Optional[str] = None
     cron_expr: Optional[str] = None
     enabled: Optional[bool] = None
+    timezone: Optional[str] = None
 
 
-def _check_cron(expr: str) -> None:
+def _check_cron(expr: str, timezone: str = "") -> None:
     from ..scheduler.service import SchedulerService
     try:
-        SchedulerService.validate_cron(expr)
+        SchedulerService.validate_cron(expr, timezone)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid cron expression: {exc}")
+        raise HTTPException(status_code=400, detail=f"Invalid schedule: {exc}")
+
+
+def _check_timezone(name: str) -> None:
+    from ..scheduler.service import SchedulerService
+    try:
+        SchedulerService.validate_timezone(name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid timezone: {exc}")
 
 
 @app.get("/jobs")
@@ -844,9 +854,12 @@ async def list_jobs():
 
 @app.post("/jobs")
 async def create_job(job: JobCreate):
-    _check_cron(job.cron_expr)
-    created = get_agent().scheduler_service.add_job(name=job.name, prompt=job.prompt, cron_expr=job.cron_expr,
-                                                    description=job.description, enabled=job.enabled)
+    _check_timezone(job.timezone)
+    _check_cron(job.cron_expr, job.timezone)
+    created = get_agent().scheduler_service.add_job(
+        name=job.name, prompt=job.prompt, cron_expr=job.cron_expr,
+        description=job.description, enabled=job.enabled, timezone=job.timezone,
+    )
     return {"success": True, "job": created.to_dict()}
 
 
@@ -868,8 +881,10 @@ async def get_job(job_id: str):
 async def update_job(job_id: str, update: JobUpdate):
     agent = get_agent()
     fields = {k: v for k, v in update.model_dump(exclude_unset=True).items() if v is not None}
+    if "timezone" in fields:
+        _check_timezone(fields["timezone"])
     if "cron_expr" in fields:
-        _check_cron(fields["cron_expr"])
+        _check_cron(fields["cron_expr"], fields.get("timezone", ""))
     job = agent.scheduler_service.update_job(job_id, **fields) if fields else agent.scheduler_store.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")

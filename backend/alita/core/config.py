@@ -109,6 +109,11 @@ def instructions_path() -> Path:
     return p / "INSTRUCTIONS.md"
 
 
+def timezone_name() -> str:
+    """Default IANA timezone for scheduled jobs ("" = host local time)."""
+    return _env("ALITA_TIMEZONE", "").strip()
+
+
 # ─── Agent tunables ───────────────────────────────────────────────────
 
 class AgentSettings:

@@ -384,6 +384,7 @@ export async function createJob(job: {
   cron_expr: string;
   description?: string;
   enabled?: boolean;
+  timezone?: string;
 }): Promise<ScheduledJob> {
   const data = await request<{ job: ScheduledJob }>('/jobs', json('POST', job));
   return data.job;

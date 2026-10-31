@@ -127,6 +127,7 @@ Everything is in `backend/.env` (see [`backend/.env.example`](backend/.env.examp
 | `ALITA_MAX_ITERATIONS` | `50` | Tool steps per turn |
 | `ALITA_APPROVAL_MODE` | `auto` | `auto` / `always` / `never` |
 | `ALITA_API_TOKEN` | — | Require a bearer token (needed to bind non-loopback) |
+| `ALITA_TIMEZONE` | host local | Default IANA timezone for scheduled jobs (per-job override available) |
 | `ELEVENLABS_API_KEY` | — | Enables the ElevenLabs voice provider |
 | `ELEVENLABS_MODEL` | `eleven_multilingual_v2` | ElevenLabs speech model |
 | `OPENAI_TTS_MODEL` | `gpt-4o-mini-tts` | OpenAI speech model (uses your OpenAI key) |
