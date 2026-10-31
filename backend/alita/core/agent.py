@@ -343,8 +343,8 @@ class AlitaAgent:
         self.sandbox_mgr.prefetch_docker_status()
         self.kanban_executor.start()
         self.scheduler_service.start()
-        self.spawn(self._load_mcp())
-        self.spawn(self._warm_vectors())
+        self.spawn(self._load_mcp(), name="load-mcp")
+        self.spawn(self._warm_vectors(), name="warm-vectors")
 
     async def _load_mcp(self) -> None:
         try:
@@ -360,11 +360,46 @@ class AlitaAgent:
             await self.longterm.reindex()
             await self.skills.sync_index()
 
-    def spawn(self, coro: Awaitable[Any]) -> asyncio.Task:
+    def spawn(
+        self,
+        coro: Awaitable[Any],
+        name: Optional[str] = None,
+        *,
+        timeout: Optional[float] = None,
+        no_timeout: bool = False,
+    ) -> asyncio.Task:
+        """Run a bounded background task and log its outcome.
+
+        ``timeout`` defaults to ``ALITA_BACKGROUND_TIMEOUT`` (120s). Pass
+        ``no_timeout=True`` for work that legitimately runs long, such as a
+        delegated sub-agent; do not silently use it to hide a hang.
+        """
+        label = name or getattr(coro, "__name__", "background")
+        limit = None if no_timeout else (timeout if timeout is not None else self.settings.background_timeout)
+        if limit and limit > 0:
+            coro = asyncio.wait_for(coro, timeout=float(limit))
         task = asyncio.ensure_future(coro)
+        task.set_name(label)
         self._background.add(task)
-        task.add_done_callback(self._background.discard)
+        task.add_done_callback(self._on_background_done)
         return task
+
+    def _on_background_done(self, task: asyncio.Task) -> None:
+        self._background.discard(task)
+        name = task.get_name()
+        if task.cancelled():
+            logger.info("background task cancelled: %s", name)
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        if isinstance(exc, asyncio.TimeoutError):
+            logger.warning("background task timed out and was cancelled: %s", name)
+            return
+        logger.warning(
+            "background task failed: %s (%s)", name, exc,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
 
     async def _persist_usage(
         self,
@@ -397,8 +432,13 @@ class AlitaAgent:
     async def shutdown(self) -> None:
         for sess in self.sessions.running():
             self.interrupt(sess.id)
-        for task in list(self._background):
+        pending = list(self._background)
+        if pending:
+            logger.info("cancelling %d background task(s) at shutdown", len(pending))
+        for task in pending:
             task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         try:
             await self.kanban_executor.stop()
         except Exception:  # noqa: BLE001
@@ -560,7 +600,7 @@ class AlitaAgent:
             if sess.kind == "chat" and not sess.title:
                 self.sessions.set_title(sess, fallback_title(query))
                 if self.settings.auto_title:
-                    self.spawn(self._generate_title(sess, query, emit))
+                    self.spawn(self._generate_title(sess, query, emit), name=f"generate-title:{sess.id}")
             await emit({"type": "turn_start", "session_id": sess.id, "user_message_id": user_msg.get("_id"),
                         "title": sess.title})
 
@@ -695,7 +735,7 @@ class AlitaAgent:
                         completion_tokens=completion_tokens,
                         cached_tokens=cached_tokens,
                         estimated=not bool(measured_prompt),
-                    ))
+                    ), name=f"persist-usage:{sess.id}")
 
                 if error:
                     await emit({"type": "error", "message": error})
@@ -930,14 +970,17 @@ class AlitaAgent:
     def _after_turn(self, sess: Session, content: Any, final_text: str, start_idx: int, tool_calls: int) -> None:
         if sess.kind == "chat" and self.settings.memory_auto_extract:
             tools_used = sorted({m.get("name", "") for m in sess.messages[start_idx:] if m.get("role") == "tool"})
-            self.spawn(self._extract_memories(sess.id, content, final_text, ", ".join(t for t in tools_used if t)))
+            self.spawn(
+                self._extract_memories(sess.id, content, final_text, ", ".join(t for t in tools_used if t)),
+                name=f"extract-memories:{sess.id}",
+            )
         if (sess.kind in ("chat", "job") and self.settings.skills_auto_create
                 and tool_calls >= self.settings.skills_min_tool_calls):
             turn_msgs = sess.messages[start_idx:]
             used_skill_tools = any(m.get("name") == "skill_manage" for m in turn_msgs if m.get("role") == "tool")
             failures = sum(1 for m in turn_msgs if m.get("role") == "tool" and not (m.get("_meta") or {}).get("success", True))
             if not used_skill_tools and failures <= tool_calls // 2:
-                self.spawn(self._reflect_skill(content, turn_msgs, final_text))
+                self.spawn(self._reflect_skill(content, turn_msgs, final_text), name=f"reflect-skill:{sess.id}")
 
     async def _extract_memories(self, session_id: str, content: Any, final_text: str, tools_used: str) -> None:
         try:

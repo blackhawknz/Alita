@@ -125,6 +125,7 @@ Everything is in `backend/.env` (see [`backend/.env.example`](backend/.env.examp
 | `ALITA_MEMORY_AUTO_RECALL` / `_AUTO_EXTRACT` | `true` | Memory automation |
 | `ALITA_SKILLS_AUTO_CREATE` | `true` | Distil complex tasks into skills |
 | `ALITA_MAX_ITERATIONS` | `50` | Tool steps per turn |
+| `ALITA_BACKGROUND_TIMEOUT` | `120` | Seconds before a background task is cancelled |
 | `ALITA_APPROVAL_MODE` | `auto` | `auto` / `always` / `never` |
 | `ALITA_API_TOKEN` | — | Require a bearer token (needed to bind non-loopback) |
 | `ALITA_TIMEZONE` | host local | Default IANA timezone for scheduled jobs (per-job override available) |
