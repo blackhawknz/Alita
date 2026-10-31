@@ -163,7 +163,7 @@ export default function VoiceSection({
       })
       .catch((e) => toast.error(api.errorMessage(e)))
       .finally(() => setLoading(false));
-  }, [applyStatus, settings.voice?.provider, toast]);
+  }, [applyStatus, toast]);
 
   useEffect(load, [load]);
 
