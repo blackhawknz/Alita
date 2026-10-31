@@ -68,11 +68,6 @@ app.add_middleware(
 )
 app.add_middleware(AuthMiddleware, token=configured_token())
 
-# Story-world endpoints (Fortitude): /agent/turn, /agent/reflect, /agent/memory…
-from .worlds import make_router as _make_world_router  # noqa: E402
-
-app.include_router(_make_world_router(lambda: get_agent()))
-
 SSE_HEADERS = {"Cache-Control": "no-cache, no-transform", "Connection": "keep-alive", "X-Accel-Buffering": "no"}
 
 
