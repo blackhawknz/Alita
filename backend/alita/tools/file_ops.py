@@ -12,6 +12,7 @@ exist when the checkpoint was taken).
 from __future__ import annotations
 
 import asyncio
+import difflib
 import fnmatch
 import json
 import os
@@ -77,6 +78,66 @@ def _is_binary(path: Path, probe: int = 8192) -> bool:
             return b"\x00" in fh.read(probe)
     except OSError:
         return True
+
+
+def _normalise_ws(text: str) -> Tuple[str, List[int]]:
+    """
+    Collapse horizontal whitespace runs and drop trailing whitespace.
+
+    Returns the normalised text plus a map from each normalised character to
+    its index in the original string, so a normalised match can be translated
+    back into a byte-for-byte replacement.
+    """
+    out: List[str] = []
+    mapping: List[int] = []
+    i = 0
+    length = len(text)
+    while i < length:
+        ch = text[i]
+        if ch in " \t":
+            j = i
+            while j < length and text[j] in " \t":
+                j += 1
+            if j >= length or text[j] in "\r\n":
+                i = j
+                continue
+            out.append(" ")
+            mapping.append(i)
+            i = j
+            continue
+        out.append(ch)
+        mapping.append(i)
+        i += 1
+    return "".join(out), mapping
+
+
+def _normalise_line(line: str) -> str:
+    return re.sub(r"[ \t]+", " ", line).strip()
+
+
+def _closest_region(current: str, old: str) -> Dict[str, Any]:
+    """Find the file region most similar to ``old`` for a failed patch."""
+    lines = current.splitlines()
+    if not lines:
+        return {"line": 1, "text": ""}
+    old_lines = old.splitlines() or [old]
+    window = max(1, len(old_lines))
+    wanted = [_normalise_line(line) for line in old_lines]
+    best_ratio = -1.0
+    best_start = 0
+    wanted_text = "\n".join(wanted)
+    for start in range(max(1, len(lines) - window + 1)):
+        candidate = [_normalise_line(line) for line in lines[start:start + window]]
+        ratio = difflib.SequenceMatcher(None, wanted_text, "\n".join(candidate)).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_start = start
+    snippet = lines[max(0, best_start - 1):best_start + 2]
+    return {
+        "line": best_start + 1,
+        "text": "\n".join(snippet),
+        "similarity": round(max(0.0, best_ratio), 2),
+    }
 
 
 def _walk_files(root: Path) -> Iterator[Path]:
@@ -487,18 +548,48 @@ class FileOps:
 
         with open(filepath, "r", encoding="utf-8", newline="") as fh:
             current = fh.read()
-        # Match the file's line endings so LF-authored patches apply to CRLF files.
-        if "\r\n" in current and "\r\n" not in old_string and "\n" in old_string:
-            old_string = old_string.replace("\n", "\r\n")
+        # Match the file's line endings so LF-authored patches apply to CRLF
+        # files (and vice versa) without double-converting either string.
+        if "\r\n" in current:
+            old_string = old_string.replace("\r\n", "\n").replace("\n", "\r\n")
             new_string = new_string.replace("\r\n", "\n").replace("\n", "\r\n")
+        else:
+            old_string = old_string.replace("\r\n", "\n")
+            new_string = new_string.replace("\r\n", "\n")
 
         count = current.count(old_string)
+        fuzzy = False
         if count == 0:
-            return {
-                "success": False,
-                "error": "old_string not found in file (it must match exactly, including whitespace)",
-                "matches": 0,
-            }
+            normalised_current, mapping = _normalise_ws(current)
+            normalised_old, _ = _normalise_ws(old_string)
+            normalised_count = normalised_current.count(normalised_old) if normalised_old else 0
+            if normalised_count > 1:
+                return {
+                    "success": False,
+                    "error": (
+                        f"old_string matches {normalised_count} times after normalising "
+                        "whitespace; include more surrounding context."
+                    ),
+                    "matches": normalised_count,
+                }
+            if normalised_count == 1:
+                start = normalised_current.find(normalised_old)
+                end = start + len(normalised_old)
+                start_original = mapping[start]
+                end_original = mapping[end - 1] + 1
+                count = 1
+                fuzzy = True
+            else:
+                return {
+                    "success": False,
+                    "error": "old_string not found in file (it must match exactly, including whitespace)",
+                    "matches": 0,
+                    "closest": _closest_region(current, old_string),
+                    "hint": (
+                        "The closest region is shown above. Re-read those lines and retry "
+                        "with the exact text, or use write for a larger rewrite."
+                    ),
+                }
         if count > 1 and not replace_all:
             return {
                 "success": False,
@@ -510,10 +601,13 @@ class FileOps:
             }
 
         cid = self.checkpointer.create([filepath])
-        new_content = current.replace(old_string, new_string) if replace_all else current.replace(old_string, new_string, 1)
+        if fuzzy:
+            new_content = current[:start_original] + new_string + current[end_original:]
+        else:
+            new_content = current.replace(old_string, new_string) if replace_all else current.replace(old_string, new_string, 1)
         with open(filepath, "w", encoding="utf-8", newline="") as fh:
             fh.write(new_content)
-        return {
+        result: Dict[str, Any] = {
             "success": True,
             "path": str(filepath),
             "replacements": count if replace_all else 1,
@@ -521,6 +615,10 @@ class FileOps:
             "message": "Patch applied successfully",
             "diff_lines": abs(new_content.count("\n") - current.count("\n")),
         }
+        if fuzzy:
+            result["fuzzy"] = True
+            result["note"] = "Matched after normalising whitespace."
+        return result
 
     def _list_dir(self, path: str, pattern: str = "") -> Dict[str, Any]:
         dirpath = self._resolve_path(path) if path else self.workspace
