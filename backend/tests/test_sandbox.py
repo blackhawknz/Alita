@@ -76,13 +76,20 @@ def test_is_isolated_other_tools_safe_by_default():
 # ─── timeout partial output ───────────────────────────────────────
 
 
-def test_run_process_returns_partial_output_on_timeout():
-    script = "print('a', flush=True); import time; time.sleep(30); print('b', flush=True)"
+def test_run_process_returns_unflushed_stdout_on_timeout():
+    script = "print('a'); import time; time.sleep(30); print('b')"
     result = run_process([sys.executable, "-c", script], timeout=2, max_output=10_000)
     assert result["timed_out"] is True
     assert result["success"] is False
     assert "a" in result["stdout"]
     assert "timed out" in result["error"].lower()
+
+
+def test_run_process_returns_partial_stderr_on_timeout():
+    script = "import sys, time; sys.stderr.write('ERR-LINE\\n'); time.sleep(30)"
+    result = run_process([sys.executable, "-c", script], timeout=2, max_output=10_000)
+    assert result["timed_out"] is True
+    assert "ERR-LINE" in result["stderr"]
 
 
 # ─── execute threads work_dir, rejects traversal ──────────────────
