@@ -311,6 +311,11 @@ async function runQueue(key: string, runId: number) {
   }
 }
 
+/** Strip fenced code from streamed markdown before it reaches TTS. */
+export function speechText(markdown: string): string {
+  return (markdown || '').replace(/```[\s\S]*?(?:```|$)/g, ' ');
+}
+
 /** Return the next natural chunk to enqueue, and how much text it consumed. */
 export function nextSpeechChunk(text: string, final: boolean): { text: string; consumed: number } {
   if (!text) return { text: '', consumed: 0 };
