@@ -5,7 +5,9 @@ import { ArrowDown, CircleAlert, Info, RefreshCw, Upload, WifiOff } from 'lucide
 import * as api from '@/lib/api';
 import { useVoiceConversation } from '@/lib/conversation';
 import { cx, downloadText, safeFilename } from '@/lib/format';
+import { turnText } from '@/lib/turns';
 import type { Health, SessionSummary, SlashCommand } from '@/lib/types';
+import { enqueueSpeech, markStreamedSpeech, nextSpeechChunk } from '@/lib/voice';
 import type { SessionActions } from '../AppShell';
 import { useToast } from '../Toaster';
 import { CenteredSpinner } from '../ui';
@@ -63,6 +65,43 @@ export default function ChatView(props: Props) {
     },
     onError: toast.error,
   });
+  const speechCursor = useRef<{ key: string | null; offset: number }>({ key: null, offset: 0 });
+
+  // Speak complete sentences while the reply is still streaming. This removes
+  // the long wait between finishing a spoken turn and hearing the first word.
+  useEffect(() => {
+    if (!voice.enabled) {
+      speechCursor.current = { key: null, offset: 0 };
+      return;
+    }
+    const live = chat.live;
+    let turn = live;
+    if (!turn) {
+      const last = chat.items[chat.items.length - 1];
+      if (last?.kind === 'assistant' && speechCursor.current.key === last.turn.key) turn = last.turn;
+    }
+    if (!turn) return;
+    if (speechCursor.current.key !== turn.key) {
+      if (!live) return;
+      speechCursor.current = { key: turn.key, offset: 0 };
+    }
+    const raw = turnText(turn);
+    if (!raw) return;
+    const fenceCount = (raw.match(/```/g) || []).length;
+    const safeLength = fenceCount % 2 === 1 ? raw.lastIndexOf('```') : raw.length;
+    if (safeLength <= 0) return;
+    const safe = raw.slice(0, safeLength);
+    markStreamedSpeech(turn.key);
+    let offset = Math.min(speechCursor.current.offset, safe.length);
+    const final = (!live || turn.status !== 'streaming') && safeLength === raw.length;
+    while (offset < safe.length) {
+      const part = nextSpeechChunk(safe.slice(offset), final);
+      if (!part.text || part.consumed <= 0) break;
+      offset += part.consumed;
+      enqueueSpeech(turn.key, part.text, toast.error);
+    }
+    speechCursor.current.offset = offset;
+  }, [chat.live, chat.items, voice.enabled, toast.error]);
 
   const activeId = chat.sessionId || sessionId;
   const title = session?.title || chat.title || (activeId ? 'Untitled chat' : 'New chat');

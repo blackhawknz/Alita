@@ -34,6 +34,15 @@ const IDLE = { key: null as string | null, state: 'idle' as PlayState };
 const playback = store(IDLE);
 let audio: HTMLAudioElement | null = null;
 let token = 0;
+let segmentDone: (() => void) | null = null;
+const streamedKeys = new Set<string>();
+const speechQueue: {
+  key: string | null;
+  items: string[];
+  active: boolean;
+  runId: number;
+  onError?: (message: string) => void;
+} = { key: null, items: [], active: false, runId: 0 };
 
 function release() {
   if (!audio) return;
@@ -54,6 +63,14 @@ function stopBrowserSpeech() {
 
 export function stopSpeaking() {
   token++;
+  speechQueue.runId++;
+  speechQueue.key = null;
+  speechQueue.items = [];
+  speechQueue.active = false;
+  speechQueue.onError = undefined;
+  const finish = segmentDone;
+  segmentDone = null;
+  finish?.();
   release();
   stopBrowserSpeech();
   playback.set(IDLE);
@@ -134,6 +151,189 @@ export async function speak(key: string, text: string, onError?: (message: strin
       fail(api.errorMessage(e));
     }
   }
+}
+
+/** Streamed replies are fed here sentence by sentence so speech starts early. */
+export function enqueueSpeech(key: string, text: string, onError?: (message: string) => void) {
+  const clean = text.trim();
+  if (!clean) return;
+  if (speechQueue.key !== key) {
+    stopSpeaking();
+    speechQueue.key = key;
+  }
+  speechQueue.onError = onError || speechQueue.onError;
+  speechQueue.items.push(clean);
+  if (!speechQueue.active) void runQueue(key, speechQueue.runId);
+}
+
+export function markStreamedSpeech(key: string) {
+  streamedKeys.add(key);
+  if (streamedKeys.size > 80) {
+    const first = streamedKeys.values().next().value;
+    if (first) streamedKeys.delete(first);
+  }
+}
+
+function queueError(message: string) {
+  const notify = speechQueue.onError;
+  stopSpeaking();
+  notify?.(message);
+}
+
+function playBrowserSegment(
+  key: string,
+  text: string,
+  status: VoiceStatus,
+  mine: number,
+): Promise<boolean> {
+  const synth = typeof window !== 'undefined' ? window.speechSynthesis : undefined;
+  if (!synth || typeof SpeechSynthesisUtterance === 'undefined') {
+    queueError('This browser has no speech synthesis. Choose a server voice instead.');
+    return Promise.resolve(false);
+  }
+  const utter = new SpeechSynthesisUtterance(text);
+  const voices = synth.getVoices();
+  const wanted = status.voice?.voice_id;
+  const chosen =
+    (wanted && voices.find((v) => v.name === wanted)) ||
+    voices.find((v) => v.lang?.toLowerCase().startsWith('en-gb')) ||
+    voices.find((v) => v.lang?.toLowerCase().startsWith('en')) ||
+    voices[0];
+  if (chosen) utter.voice = chosen;
+  utter.rate = clamp(status.settings?.speed ?? 1, 0.5, 2);
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      segmentDone = null;
+      resolve(ok);
+    };
+    segmentDone = () => finish(false);
+    utter.onstart = () => {
+      if (mine === token) playback.set({ key, state: 'playing' });
+    };
+    utter.onend = () => finish(true);
+    utter.onerror = (e) => {
+      if (e.error === 'interrupted' || e.error === 'canceled') {
+        finish(false);
+        return;
+      }
+      finish(false);
+      if (mine === token) queueError(`Speech failed: ${e.error || 'unknown error'}`);
+    };
+    synth.speak(utter);
+  });
+}
+
+async function playServerSegment(key: string, text: string, mine: number): Promise<boolean> {
+  let prepared;
+  try {
+    prepared = await api.prepareSpeech(text);
+  } catch (e) {
+    if (mine === token) queueError(api.errorMessage(e));
+    return false;
+  }
+  if (mine !== token) return false;
+  const el = new Audio(api.withToken(prepared.url));
+  audio = el;
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      segmentDone = null;
+      resolve(ok);
+    };
+    segmentDone = () => finish(false);
+    el.onplaying = () => {
+      if (mine === token) playback.set({ key, state: 'playing' });
+    };
+    el.onended = () => {
+      if (mine === token) release();
+      finish(true);
+    };
+    el.onerror = async () => {
+      const state = await api.getSpeechState(prepared.id).catch(() => null);
+      if (mine === token) release();
+      finish(false);
+      if (mine === token) queueError(state?.error || 'Could not play the audio.');
+    };
+    el.play().catch((e) => {
+      if (mine !== token) {
+        finish(false);
+      } else if (e instanceof DOMException && e.name === 'NotAllowedError') {
+        finish(false);
+        queueError('The browser blocked autoplay. Click the speaker button to listen.');
+      } else if (e instanceof DOMException && e.name === 'AbortError') {
+        finish(false);
+      } else {
+        finish(false);
+        queueError(api.errorMessage(e));
+      }
+    });
+  });
+}
+
+async function runQueue(key: string, runId: number) {
+  if (speechQueue.active) return;
+  speechQueue.active = true;
+  const mine = token;
+  try {
+    if (!playbackStatus()) await refreshVoiceStatus();
+    const status = playbackStatus();
+    if (!status?.configured) {
+      return;
+    }
+    while (
+      speechQueue.runId === runId &&
+      speechQueue.key === key &&
+      mine === token &&
+      speechQueue.items.length > 0
+    ) {
+      const text = speechQueue.items.shift()!;
+      playback.set({ key, state: 'loading' });
+      const ok = status.provider === 'browser'
+        ? await playBrowserSegment(key, text, status, mine)
+        : await playServerSegment(key, text, mine);
+      if (!ok || speechQueue.runId !== runId || speechQueue.key !== key || mine !== token) return;
+    }
+  } finally {
+    if (speechQueue.runId === runId) {
+      speechQueue.active = false;
+      if (speechQueue.key === key && mine === token) {
+        speechQueue.key = null;
+        speechQueue.items = [];
+        speechQueue.onError = undefined;
+        playback.set(IDLE);
+      }
+    }
+  }
+}
+
+/** Return the next natural chunk to enqueue, and how much text it consumed. */
+export function nextSpeechChunk(text: string, final: boolean): { text: string; consumed: number } {
+  if (!text) return { text: '', consumed: 0 };
+  const sentences = /[.!?…]+["')\]]*(?:\s+|$)/g;
+  const match = sentences.exec(text);
+  if (match) {
+    const end = match.index + match[0].length;
+    const chunk = text.slice(0, end).trim();
+    if (chunk) return { text: chunk, consumed: end };
+  }
+  const paragraph = text.indexOf('\n\n');
+  if (paragraph > 0) {
+    const chunk = text.slice(0, paragraph).trim();
+    if (chunk) return { text: chunk, consumed: paragraph + 2 };
+  }
+  if (final) return { text: text.trim(), consumed: text.length };
+  const max = 220;
+  if (text.length >= max) {
+    const space = text.lastIndexOf(' ', max);
+    const end = space > 80 ? space : max;
+    return { text: text.slice(0, end).trim(), consumed: end };
+  }
+  return { text: '', consumed: 0 };
 }
 
 export function usePlayback(key: string): PlayState {
@@ -232,6 +432,7 @@ export function useAutoSpeak(): boolean {
 export function maybeAutoSpeak(key: string, text: string, onError?: (message: string) => void) {
   loadAuto();
   const s = status.get();
+  if (streamedKeys.has(key)) return;
   if (!autoSpeak.get() || !text.trim() || !s?.configured || !s.voice) return;
   void speak(key, text, onError);
 }
