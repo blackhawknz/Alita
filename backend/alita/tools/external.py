@@ -149,25 +149,52 @@ class ExternalToolManager:
         )
         self.sqlite = sqlite if sqlite is not None else getattr(agent, "sqlite", None)
         self._executors = executors
+        if self._executors is None:
+            agent_execs = getattr(agent, "executors", None)
+            self._executors = agent_execs if isinstance(agent_execs, dict) else {}
 
     # ── executor lookup ─────────────────────────────────────────────
 
     def _registry(self) -> Dict[str, Executor]:
-        if self._executors is not None:
-            return self._executors
-        return getattr(self.agent, "executors", {}) or {}
+        """Return the stable executor registry (never a throwaway dict)."""
+        if self._executors is None:
+            agent_execs = getattr(self.agent, "executors", None)
+            self._executors = agent_execs if isinstance(agent_execs, dict) else {}
+        return self._executors
 
     def _get_executor(self, name: str) -> Executor:
         executor = self._registry().get(name)
         if executor is not None:
+            if (
+                name == "opencode"
+                and hasattr(executor, "default_model")
+                and not getattr(executor, "default_model", None)
+            ):
+                raise ExternalToolError(
+                    "executor 'opencode' has no model configured; set "
+                    "ALITA_EXECUTOR_OPENCODE_MODEL (e.g. deepseek/deepseek-flash)"
+                )
             return executor
         if name == "opencode":
+            model = self._opencode_model()
+            if not model:
+                raise ExternalToolError(
+                    "executor 'opencode' has no model configured; set "
+                    "ALITA_EXECUTOR_OPENCODE_MODEL (e.g. deepseek/deepseek-flash)"
+                )
             # Lazy registration keeps an app on a machine without OpenCode
             # usable, and picks the CLI up if it appears after startup.
             try:
                 from ..executors.opencode import OpenCodeExecutor
 
-                executor = OpenCodeExecutor(extra_args=self._opencode_extra_args())
+                executor = OpenCodeExecutor(
+                    default_model=model,
+                    variant=self._opencode_variant() or None,
+                    extra_args=self._opencode_extra_args(),
+                    store=self.sqlite,
+                )
+            except ExternalToolError:
+                raise
             except Exception as exc:  # noqa: BLE001
                 raise ExternalToolError(
                     f"executor 'opencode' is unavailable: {exc}"
@@ -178,6 +205,14 @@ class ExternalToolManager:
             f"executor {name!r} is not registered; available executors: "
             f"{', '.join(sorted(self._registry())) or 'none'}"
         )
+
+    def _opencode_model(self) -> str:
+        return str(getattr(self.settings, "executor_opencode_model", "") or "").strip()
+
+    def _opencode_variant(self) -> str:
+        return str(
+            getattr(self.settings, "executor_opencode_variant", "") or ""
+        ).strip()
 
     def _opencode_extra_args(self) -> List[str]:
         if getattr(self.settings, "executor_allow_skip_permissions", False):
@@ -202,16 +237,65 @@ class ExternalToolManager:
             logger.debug("away-mode check failed for external delegation", exc_info=True)
         return None
 
-    def _find_handle(self, handle: str) -> Tuple[Optional[str], Optional[Executor]]:
-        for name, executor in self._registry().items():
+    def _find_handle(
+        self, handle: str
+    ) -> Tuple[Optional[str], Optional[Executor], Optional[str]]:
+        """Locate a live handle or rehydrate one persisted before a restart.
+
+        Returns ``(name, executor, error)``. ``error`` is only set when a
+        stored record exists but cannot safely be resumed (for example a
+        workdir outside the allowed roots).
+        """
+        for name, executor in list(self._registry().items()):
             check = getattr(executor, "has_handle", None)
             if callable(check):
                 try:
                     if check(handle):
-                        return name, executor
+                        return name, executor, None
                 except Exception:  # noqa: BLE001
                     logger.debug("has_handle failed for %s", name, exc_info=True)
-        return None, None
+
+        if self.sqlite is None:
+            return None, None, None
+        try:
+            record = self.sqlite.load_external_handle(handle)
+        except Exception:  # noqa: BLE001
+            logger.warning("Could not load external handle %s", handle, exc_info=True)
+            return None, None, None
+        if not record:
+            return None, None, None
+
+        name = str(record.get("executor") or "").strip()
+        try:
+            executor = self._get_executor(name)
+        except ExternalToolError as exc:
+            return None, None, str(exc)
+
+        try:
+            resolved = resolve_workdir(
+                record.get("workdir") or None,
+                workspace=self.workspace,
+                allowed_roots_raw=self._allowed_roots_raw(),
+            )
+        except WorkdirError as exc:
+            logger.warning("Refusing to resume stored handle %s: %s", handle, exc)
+            return None, None, str(exc)
+
+        rehydrate = getattr(executor, "rehydrate", None)
+        if not callable(rehydrate):
+            return None, None, None
+
+        try:
+            rehydrate(
+                handle,
+                workdir=resolved,
+                session_id=handle,
+                cost=_float(record.get("cost", 0.0), 0.0),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not rehydrate external handle %s", handle, exc_info=True)
+            return None, None, f"could not resume {handle!r}: {exc}"
+        return name, executor, None
 
     # ── spend tracking ──────────────────────────────────────────────
 
@@ -314,12 +398,15 @@ class ExternalToolManager:
         if away_error:
             return _failure("", away_error, session_id=handle)
 
-        name, ex = self._find_handle(handle)
+        name, ex, resume_error = self._find_handle(handle)
         if ex is None or name is None:
             return _failure(
                 "",
-                f"unknown external session: {handle!r}. Only sessions started by "
-                "this process can be resumed.",
+                resume_error
+                or (
+                    f"unknown external session: {handle!r}. Only sessions started "
+                    "by this process can be resumed."
+                ),
                 session_id=handle,
             )
 
@@ -358,6 +445,7 @@ class ExternalToolManager:
         text_parts: List[str] = []
         errors: List[str] = []
         call_cost = 0.0
+        saw_done = False
         max_cost = _float(getattr(self.settings, "executor_max_cost", 0.0), 0.0)
         daily_cap = _float(getattr(self.settings, "executor_daily_cost", 0.0), 0.0)
         timeout_minutes = _float(max_minutes, 30.0)
@@ -388,6 +476,8 @@ class ExternalToolManager:
                         break
                 if event.kind == "text" and event.text:
                     text_parts.append(event.text)
+                elif event.kind == "done":
+                    saw_done = True
                 elif event.kind == "error" and event.text:
                     errors.append(event.text)
 
@@ -418,6 +508,8 @@ class ExternalToolManager:
             self._record_spend(name, call_cost)
 
         response = "".join(text_parts).strip()
+        if not errors and not response and not saw_done:
+            errors.append(f"{name} produced no output")
         if errors and not response:
             report = Report(kind="failed", summary="; ".join(errors)).to_dict()
         else:

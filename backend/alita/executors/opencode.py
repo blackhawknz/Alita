@@ -77,13 +77,17 @@ class OpenCodeExecutor:
         *,
         binary: str | None = None,
         default_model: str | None = None,
+        variant: str | None = None,
         timeout: float = 1800.0,
         extra_args: List[str] | None = None,
+        store: Any = None,
     ):
         self.binary = binary
         self.default_model = default_model
+        self.variant = variant
         self.timeout = float(timeout)
         self.extra_args = list(extra_args or [])
+        self.store = store
         self._command_prefix = self._resolve_command(binary)
         self._runs: Dict[str, _Run] = {}
 
@@ -154,8 +158,62 @@ class OpenCodeExecutor:
 
         if run.session_id:
             self._runs.setdefault(run.session_id, run)
+            self._persist(run)
             return run.session_id
         return provisional
+
+    def rehydrate(
+        self,
+        handle: str,
+        *,
+        workdir: Path | str | None = None,
+        session_id: str | None = None,
+        cost: float = 0.0,
+    ) -> _Run:
+        """Rebuild an in-memory run from a persisted handle (after a restart).
+
+        ``session_id`` defaults to ``handle`` because OpenCode session ids are
+        themselves the handle. The caller is responsible for validating
+        ``workdir`` before passing it here.
+        """
+        sid = str(session_id or handle)
+        run = self._runs.get(handle) or self._runs.get(sid)
+        if run is None:
+            run = _Run(
+                handle=handle,
+                session_id=sid,
+                workdir=Path(workdir) if workdir is not None else None,
+            )
+            self._runs[handle] = run
+        else:
+            run.session_id = sid
+            if workdir is not None:
+                run.workdir = Path(workdir)
+        run.initial_pending = False
+        run.cost = float(cost or 0.0)
+        run.session_ready.set()
+        self._runs.setdefault(handle, run)
+        self._runs.setdefault(sid, run)
+        return run
+
+    def _persist(self, run: _Run) -> None:
+        """Best-effort save of the resume record for ``run``."""
+        if self.store is None:
+            return
+        handle = run.session_id or run.handle
+        if not handle:
+            return
+        try:
+            self.store.save_external_handle(
+                handle,
+                self.name,
+                str(run.workdir) if run.workdir is not None else "",
+                cost=run.cost,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "Could not persist opencode handle %s", handle, exc_info=True
+            )
 
     async def send(self, handle: str, message: str) -> AsyncIterator[ExecutorEvent]:
         """Stream the initial run, then resume the same session per call."""
@@ -231,6 +289,8 @@ class OpenCodeExecutor:
         argv = [*self._command_prefix, "run", "--dir", str(work), "--format", "json"]
         if self.default_model:
             argv += ["-m", self.default_model]
+        if self.variant:
+            argv += ["--variant", self.variant]
         if self.extra_args:
             argv += self.extra_args
         if session_id:
@@ -361,11 +421,38 @@ class OpenCodeExecutor:
             self._runs.setdefault(session_id, run)
             run.handle = session_id
             run.session_ready.set()
+            self._persist(run)
 
         event_type = str(payload.get("type") or "").lower()
         part = payload.get("part")
         if not isinstance(part, dict):
             part = {}
+
+        if event_type == "error":
+            error = payload.get("error")
+            if isinstance(error, dict):
+                error_name = str(error.get("name") or "").strip()
+                error_data = error.get("data")
+                if isinstance(error_data, dict):
+                    message = str(
+                        error_data.get("message")
+                        or error_data.get("error")
+                        or ""
+                    ).strip()
+                else:
+                    message = str(error_data or "").strip()
+                if not message:
+                    message = str(error.get("message") or "").strip()
+                data = {"error": error}
+            else:
+                error_name = ""
+                message = str(error or payload.get("message") or "").strip()
+                data = {"error": str(error or "")}
+            if error_name and message:
+                text = f"{error_name}: {message}"
+            else:
+                text = error_name or message or "opencode reported an error"
+            return ExecutorEvent(kind="error", text=text, data=data)
 
         if event_type == "step_start":
             return ExecutorEvent(kind="status", text="working")
@@ -389,6 +476,7 @@ class OpenCodeExecutor:
 
             run.cost += cost_value
             self._merge_tokens(run.tokens, tokens)
+            self._persist(run)
             return ExecutorEvent(
                 kind="done",
                 data={
@@ -428,6 +516,9 @@ class OpenCodeExecutor:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.timeout
         timed_out = False
+        saw_text = False
+        saw_done = False
+        saw_error = False
 
         while True:
             remaining = deadline - loop.time()
@@ -441,6 +532,12 @@ class OpenCodeExecutor:
                 break
             if item is None:
                 break
+            if item.kind == "text" and item.text and item.text.strip():
+                saw_text = True
+            elif item.kind == "done":
+                saw_done = True
+            elif item.kind == "error":
+                saw_error = True
             yield item
 
         if timed_out:
@@ -471,6 +568,17 @@ class OpenCodeExecutor:
             yield ExecutorEvent(
                 kind="error",
                 text=message,
+                data={"returncode": run.returncode},
+            )
+            return
+
+        # OpenCode can exit 0 after an unreported provider failure. Treat a
+        # run that emitted no text and no done event as a failure rather than
+        # reporting an empty success to the caller.
+        if not saw_text and not saw_done and not saw_error and not run.interrupted:
+            yield ExecutorEvent(
+                kind="error",
+                text="opencode produced no output",
                 data={"returncode": run.returncode},
             )
 

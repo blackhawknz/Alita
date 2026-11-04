@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 
 from alita.core.away import AwayState
 from alita.core.config import AgentSettings
+from alita.executors.base import ExecutorEvent
 from alita.kanban.executor import KanbanExecutor
 from alita.kanban.store import EXECUTING_COLUMN, KanbanStore
 from alita.memory.sqlite_store import SQLiteStore
@@ -200,7 +201,10 @@ class _FakeExternal:
     name = "opencode"
 
     def __init__(self):
-        self.events = []
+        self.events = [
+            ExecutorEvent(kind="text", text="done"),
+            ExecutorEvent(kind="done", data={"reason": "stop"}),
+        ]
         self.started = []
         self.sent = []
 
