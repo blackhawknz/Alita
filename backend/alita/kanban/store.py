@@ -34,6 +34,9 @@ EXECUTING_COLUMN = "executing"
 #: Columns the agent is allowed to create cards in (via the kanban tool).
 AGENT_ALLOWED_CREATE_COLUMNS = ["idea"]
 
+#: Executors a card may delegate to.
+CARD_EXECUTORS = ("native", "opencode", "claude_code")
+
 
 # ─── Data model ───────────────────────────────────────────────────
 
@@ -65,6 +68,13 @@ class KanbanCard:
     auto_advance: bool = True
     max_iterations: int = 20
 
+    # Delegation
+    executor: str = "native"
+    workdir: str = ""
+    mandate: Dict[str, Any] = field(default_factory=dict)
+    max_minutes: float = 30.0
+    external_run_id: str = ""
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "id": self.id,
@@ -83,6 +93,11 @@ class KanbanCard:
             "completed_at": self.completed_at,
             "auto_advance": self.auto_advance,
             "max_iterations": self.max_iterations,
+            "executor": self.executor,
+            "workdir": self.workdir,
+            "mandate": self.mandate,
+            "max_minutes": self.max_minutes,
+            "external_run_id": self.external_run_id,
         }
 
 
@@ -145,12 +160,28 @@ class KanbanStore:
                     executed_at TEXT DEFAULT '',
                     completed_at TEXT DEFAULT '',
                     auto_advance BOOLEAN DEFAULT 1,
-                    max_iterations INTEGER DEFAULT 20
+                    max_iterations INTEGER DEFAULT 20,
+                    executor TEXT NOT NULL DEFAULT 'native',
+                    workdir TEXT NOT NULL DEFAULT '',
+                    mandate TEXT NOT NULL DEFAULT '{}',
+                    max_minutes REAL NOT NULL DEFAULT 30,
+                    external_run_id TEXT NOT NULL DEFAULT ''
                 );
                 CREATE INDEX IF NOT EXISTS idx_kanban_column ON kanban_cards(column);
                 CREATE INDEX IF NOT EXISTS idx_kanban_status ON kanban_cards(status);
                 CREATE INDEX IF NOT EXISTS idx_kanban_priority ON kanban_cards(column, priority);
             """)
+            # Columns added for external execution (idempotent for old databases).
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(kanban_cards)").fetchall()}
+            for col, ddl in [
+                ("executor", "TEXT NOT NULL DEFAULT 'native'"),
+                ("workdir", "TEXT NOT NULL DEFAULT ''"),
+                ("mandate", "TEXT NOT NULL DEFAULT '{}'"),
+                ("max_minutes", "REAL NOT NULL DEFAULT 30"),
+                ("external_run_id", "TEXT NOT NULL DEFAULT ''"),
+            ]:
+                if col not in cols:
+                    conn.execute(f"ALTER TABLE kanban_cards ADD COLUMN {col} {ddl}")
 
     # ─── CRUD ──────────────────────────────────────────────────────
 
@@ -163,9 +194,16 @@ class KanbanStore:
         tags: Optional[List[str]] = None,
         auto_advance: bool = True,
         max_iterations: int = 20,
+        executor: str = "native",
+        workdir: str = "",
+        mandate: Optional[Dict[str, Any]] = None,
+        max_minutes: float = 30.0,
+        external_run_id: str = "",
     ) -> KanbanCard:
         if column not in COLUMNS:
             column = "idea"
+        if executor not in CARD_EXECUTORS:
+            executor = "native"
         card_id = uuid.uuid4().hex[:12]
         now = datetime.utcnow().isoformat()
         with self._conn() as conn:
@@ -173,12 +211,15 @@ class KanbanStore:
                 """INSERT INTO kanban_cards
                    (id, title, description, column, priority, tags, status,
                     result, execution_session_id, error, created_at, updated_at,
-                    auto_advance, max_iterations)
-                   VALUES (?, ?, ?, ?, ?, ?, 'idle', '{}', '', '', ?, ?, ?, ?)""",
+                    auto_advance, max_iterations, executor, workdir, mandate,
+                    max_minutes, external_run_id)
+                   VALUES (?, ?, ?, ?, ?, ?, 'idle', '{}', '', '', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     card_id, title, description, column, priority,
                     json.dumps(tags or []), now, now,
                     1 if auto_advance else 0, max_iterations,
+                    executor, workdir, json.dumps(mandate or {}), max_minutes,
+                    external_run_id,
                 ),
             )
         return self.get_card(card_id)  # type: ignore[return-value]
@@ -221,12 +262,13 @@ class KanbanStore:
             "title", "description", "column", "priority", "tags",
             "status", "result", "execution_session_id", "error",
             "executed_at", "completed_at", "auto_advance", "max_iterations",
+            "executor", "workdir", "mandate", "max_minutes", "external_run_id",
         }
         updates: Dict[str, Any] = {}
         for k, v in fields.items():
             if k not in allowed:
                 continue
-            if k in ("tags", "result") and not isinstance(v, str):
+            if k in ("tags", "result", "mandate") and not isinstance(v, str):
                 v = json.dumps(v, default=str)
             updates[k] = v
 
@@ -305,4 +347,9 @@ class KanbanStore:
             completed_at=row["completed_at"] or "",
             auto_advance=bool(row["auto_advance"]),
             max_iterations=row["max_iterations"],
+            executor=row["executor"] or "native",
+            workdir=row["workdir"] or "",
+            mandate=json.loads(row["mandate"] or "{}"),
+            max_minutes=float(row["max_minutes"] if row["max_minutes"] is not None else 30.0),
+            external_run_id=row["external_run_id"] or "",
         )

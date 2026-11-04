@@ -25,7 +25,7 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 STALE_RUN_ERROR = "stale: process ended without reporting"
 
@@ -673,8 +673,34 @@ class SQLiteStore:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             if version < 2:
                 self._migrate_v2(conn)
+            if version < 5:
+                self._migrate_v5(conn)
             if version < SCHEMA_VERSION:
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    def _migrate_v5(self, conn: sqlite3.Connection) -> None:
+        """Add the Kanban external-execution columns when the table exists.
+
+        The Kanban store may be opened before or after this store, so the
+        migration is guarded and idempotent: the ``kanban_cards`` table might
+        not exist yet on a fresh database.
+        """
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'kanban_cards'"
+        ).fetchone()
+        if not exists:
+            return
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(kanban_cards)").fetchall()}
+        for col, ddl in [
+            ("executor", "TEXT NOT NULL DEFAULT 'native'"),
+            ("workdir", "TEXT NOT NULL DEFAULT ''"),
+            ("mandate", "TEXT NOT NULL DEFAULT '{}'"),
+            ("max_minutes", "REAL NOT NULL DEFAULT 30"),
+            ("external_run_id", "TEXT NOT NULL DEFAULT ''"),
+        ]:
+            if col not in cols:
+                conn.execute(f"ALTER TABLE kanban_cards ADD COLUMN {col} {ddl}")
+        logger.info("Migrating state.db to schema v5 (kanban external execution)")
 
     def _migrate_v2(self, conn: sqlite3.Connection) -> None:
         """One-shot data clean-up for databases written by v0.1."""

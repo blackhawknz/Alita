@@ -17,7 +17,7 @@ const COLUMNS = [
   { id: 'done', label: 'Done', color: 'bg-muted' },
 ];
 
-export default function KanbanView() {
+export default function KanbanView({ onOpenActivity }: { onOpenActivity?: (runId: string) => void }) {
   const toast = useToast();
   const [cards, setCards] = useState<KanbanCardType[]>([]);
   const [loading, setLoading] = useState(true);
@@ -75,9 +75,15 @@ export default function KanbanView() {
     }
   };
 
-  const handleCreate = async (column: string, title: string, description: string, tags: string[]) => {
+  const handleCreate = async (
+    column: string,
+    title: string,
+    description: string,
+    tags: string[],
+    options: { executor: KanbanCardType['executor']; workdir: string },
+  ) => {
     try {
-      const newCard = await api.createKanbanCard({ title, description, column, tags });
+      const newCard = await api.createKanbanCard({ title, description, column, tags, ...options });
       setCards((prev) => [...prev, newCard]);
       setShowCreate(null);
     } catch (e) {
@@ -168,8 +174,9 @@ export default function KanbanView() {
                           onDragStart={setDraggedId}
                           onDragEnd={handleDragEnd}
                           onDelete={handleDelete}
-                          onRetry={run(api.retryKanbanCard, 'Retry')}
-                          onCancel={run(api.cancelKanbanCard, 'Cancel')}
+                           onRetry={run(api.retryKanbanCard, 'Retry')}
+                           onCancel={run(api.cancelKanbanCard, 'Cancel')}
+                           onOpenActivity={onOpenActivity}
                         />
                       ))
                     )}
@@ -185,7 +192,7 @@ export default function KanbanView() {
         <CreateCardModal
           column={showCreate}
           onClose={() => setShowCreate(null)}
-          onCreate={(title, description, tags) => handleCreate(showCreate, title, description, tags)}
+          onCreate={(title, description, tags, options) => handleCreate(showCreate, title, description, tags, options)}
         />
       )}
     </div>

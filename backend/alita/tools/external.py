@@ -25,7 +25,7 @@ import logging
 import os
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from ..core import config
 from ..core.away import AwayState
@@ -456,6 +456,21 @@ class ExternalToolManager:
 
     # ── spend tracking ──────────────────────────────────────────────
 
+    def external_run_id(self, handle: str) -> str:
+        """Return the persisted ``external_runs.id`` for a live handle, if any."""
+        for executor in list(self._registry().values()):
+            fn = getattr(executor, "handle_run_id", None)
+            if not callable(fn):
+                continue
+            try:
+                value = fn(handle)
+            except Exception:  # noqa: BLE001
+                logger.debug("handle_run_id failed for %s", handle, exc_info=True)
+                continue
+            if value:
+                return str(value)
+        return ""
+
     def _spent(self, executor: str) -> float:
         if self.sqlite is None:
             return 0.0
@@ -484,8 +499,15 @@ class ExternalToolManager:
         mandate: Any = None,
         max_minutes: Any = 30,
         max_iterations: Optional[int] = None,
+        on_start: Optional[Callable[[str, Executor, str], None]] = None,
     ) -> Dict[str, Any]:
-        """Start an external run and return a compact result dict."""
+        """Start an external run and return a compact result dict.
+
+        ``on_start`` is an optional observer invoked with ``(name, executor,
+        handle)`` as soon as the handle exists, before any events are drained.
+        Callers (e.g. the Kanban executor) use it to learn the handle so they
+        can interrupt the real process on cancellation.
+        """
         name = str(executor or "opencode").strip().lower()
         task = str(task or "").strip()
         if not task:
@@ -529,6 +551,12 @@ class ExternalToolManager:
             return _failure(name, f"failed to start {name}: {exc}")
 
         self._save_handle_mandate(handle, name, resolved, mandate_obj)
+
+        if on_start is not None:
+            try:
+                on_start(name, ex, handle)
+            except Exception:  # noqa: BLE001
+                logger.warning("external delegate on_start observer failed", exc_info=True)
 
         iterator = ex.send(handle, "")
         return await self._collect(

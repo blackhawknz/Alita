@@ -348,6 +348,10 @@ export async function createKanbanCard(card: {
   tags?: string[];
   auto_advance?: boolean;
   max_iterations?: number;
+  executor?: KanbanCard['executor'];
+  workdir?: string;
+  mandate?: Record<string, unknown>;
+  max_minutes?: number;
 }): Promise<KanbanCard> {
   const data = await request<{ card: KanbanCard }>('/kanban/cards', json('POST', card));
   return data.card;

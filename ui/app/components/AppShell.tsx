@@ -347,7 +347,7 @@ function Shell() {
           {view === 'persona' && <PersonaView />}
           {view === 'memory' && <MemoryView />}
           {view === 'skills' && <SkillsView />}
-          {view === 'board' && <KanbanView />}
+          {view === 'board' && <KanbanView onOpenActivity={() => navigate({ view: 'activity' })} />}
           {view === 'jobs' && <JobsView />}
           {view === 'activity' && <ActivityView />}
           {view === 'gallery' && <GalleryView />}

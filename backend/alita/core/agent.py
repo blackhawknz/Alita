@@ -198,6 +198,7 @@ class AlitaAgent:
         self.kanban_store = KanbanStore(str(self.sqlite.db_path))
         self.kanban_executor = KanbanExecutor(
             self.kanban_store, self.subagent_manager, away_state=self.away_state,
+            external_manager=self.external_tools,
         )
         self.tool_registry.register(make_kanban_tool(self.kanban_store))
         self.scheduler_store = SchedulerStore(str(self.sqlite.db_path))
