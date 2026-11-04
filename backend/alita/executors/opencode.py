@@ -413,6 +413,11 @@ class OpenCodeExecutor:
         run = self._runs.get(handle)
         return run.cost if run is not None else 0.0
 
+    def handle_run_id(self, handle: str) -> Optional[str]:
+        """The ``external_runs.id`` for this handle, if a run was started."""
+        run = self._runs.get(handle)
+        return run.run_id if run is not None else None
+
     # ── process plumbing ─────────────────────────────────────────────
 
     def _argv(

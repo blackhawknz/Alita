@@ -496,6 +496,8 @@ export interface PendingApproval {
 
 // ─── Kanban / gallery / jobs (unchanged endpoints) ─────────────────
 
+export type KanbanExecutor = 'native' | 'opencode' | 'claude_code';
+
 export interface KanbanCard {
   id: string;
   title: string;
@@ -513,6 +515,11 @@ export interface KanbanCard {
   completed_at: string;
   auto_advance: boolean;
   max_iterations: number;
+  executor: KanbanExecutor;
+  workdir: string;
+  mandate: Record<string, unknown>;
+  max_minutes: number;
+  external_run_id: string;
 }
 
 export interface GalleryImage {

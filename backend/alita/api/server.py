@@ -951,6 +951,10 @@ class KanbanCardCreate(BaseModel):
     tags: list = Field(default_factory=list)
     auto_advance: bool = True
     max_iterations: int = 20
+    executor: str = "native"
+    workdir: str = ""
+    mandate: Dict[str, Any] = Field(default_factory=dict)
+    max_minutes: float = 30.0
 
 
 class KanbanCardUpdate(BaseModel):
@@ -961,6 +965,22 @@ class KanbanCardUpdate(BaseModel):
     tags: Optional[list] = None
     auto_advance: Optional[bool] = None
     max_iterations: Optional[int] = None
+    executor: Optional[str] = None
+    workdir: Optional[str] = None
+    mandate: Optional[Dict[str, Any]] = None
+    max_minutes: Optional[float] = None
+
+
+def _validate_kanban_executor(executor: str) -> str:
+    from ..kanban.store import CARD_EXECUTORS
+
+    value = str(executor or "native").strip().lower()
+    if value not in CARD_EXECUTORS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown executor {executor!r}; expected one of {', '.join(CARD_EXECUTORS)}",
+        )
+    return value
 
 
 @app.get("/kanban/cards")
@@ -972,9 +992,12 @@ async def list_kanban_cards(column: Optional[str] = Query(None)):
 
 @app.post("/kanban/cards")
 async def create_kanban_card(card: KanbanCardCreate):
+    executor = _validate_kanban_executor(card.executor)
     created = get_agent().kanban_store.create_card(
         title=card.title, description=card.description, column=card.column, priority=card.priority,
-        tags=card.tags, auto_advance=card.auto_advance, max_iterations=card.max_iterations)
+        tags=card.tags, auto_advance=card.auto_advance, max_iterations=card.max_iterations,
+        executor=executor, workdir=card.workdir, mandate=card.mandate,
+        max_minutes=card.max_minutes)
     return {"success": True, "card": created.to_dict()}
 
 
@@ -990,6 +1013,8 @@ async def get_kanban_card(card_id: str):
 async def update_kanban_card(card_id: str, update: KanbanCardUpdate):
     agent = get_agent()
     fields = {k: v for k, v in update.model_dump(exclude_unset=True).items() if v is not None}
+    if "executor" in fields:
+        fields["executor"] = _validate_kanban_executor(fields["executor"])
     card = agent.kanban_store.update_card(card_id, **fields) if fields else agent.kanban_store.get_card(card_id)
     if card is None:
         raise HTTPException(status_code=404, detail="Card not found")

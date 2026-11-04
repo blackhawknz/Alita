@@ -21,6 +21,7 @@ export default function KanbanCardComponent({
   onDelete,
   onRetry,
   onCancel,
+  onOpenActivity,
 }: {
   card: KanbanCardType;
   onDragStart: (id: string) => void;
@@ -28,6 +29,7 @@ export default function KanbanCardComponent({
   onDelete: (id: string) => void;
   onRetry: (id: string) => void;
   onCancel: (id: string) => void;
+  onOpenActivity?: (runId: string) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const meta = STATUS_META[card.status] || STATUS_META.idle;
@@ -61,6 +63,17 @@ export default function KanbanCardComponent({
 
       <div className="mt-1.5 flex items-center gap-2">
         <span className={cx('font-mono text-[10px] uppercase tracking-wide', meta.color)}>{meta.label}</span>
+        {card.executor && (
+          <span
+            className={cx(
+              'rounded px-1 py-px font-mono text-[9.5px]',
+              card.executor === 'native' ? 'bg-elevated text-muted' : 'bg-primary/15 text-primary',
+            )}
+            title={`Executor: ${card.executor}`}
+          >
+            {card.executor}
+          </span>
+        )}
         {tags.length > 0 && (
           <div className="flex gap-1 overflow-hidden">
             {tags.slice(0, 3).map((tag) => (
@@ -84,6 +97,13 @@ export default function KanbanCardComponent({
             <span className="text-[9.5px] font-semibold uppercase tracking-wider text-muted-2">Description</span>
             <p className="mt-1 whitespace-pre-wrap text-xs leading-relaxed text-fg-2">{card.description || '(no description)'}</p>
           </div>
+          {card.executor && card.executor !== 'native' && (
+            <div className="text-[10px] text-muted-2">
+              <div>Executor: {card.executor}</div>
+              {card.workdir && <div className="truncate font-mono">Workdir: {card.workdir}</div>}
+              <div>Max {card.max_minutes ?? 30} min · read-only unless a mandate is set</div>
+            </div>
+          )}
           {card.result && Object.keys(card.result).length > 0 && (
             <div>
               <span className="text-[9.5px] font-semibold uppercase tracking-wider text-muted-2">Result</span>
@@ -98,7 +118,16 @@ export default function KanbanCardComponent({
               {card.completed_at && <div>Completed: {card.completed_at}</div>}
             </div>
           )}
-          <div className="flex gap-1.5 pt-1">
+          <div className="flex flex-wrap gap-1.5 pt-1">
+            {card.external_run_id && onOpenActivity && (
+              <button
+                className="btn-ghost px-2 py-1 text-[11px]"
+                onClick={() => onOpenActivity(card.external_run_id)}
+                title={`View run ${card.external_run_id} in Activity`}
+              >
+                View run
+              </button>
+            )}
             {card.status === 'failed' && (
               <button className="btn-secondary px-2 py-1 text-[11px]" onClick={() => onRetry(card.id)}>
                 <RefreshCw className="h-3 w-3" /> Retry
@@ -128,11 +157,18 @@ export function CreateCardModal({
 }: {
   column: string;
   onClose: () => void;
-  onCreate: (title: string, description: string, tags: string[]) => void;
+  onCreate: (
+    title: string,
+    description: string,
+    tags: string[],
+    options: { executor: KanbanCardType['executor']; workdir: string },
+  ) => void;
 }) {
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [tagsStr, setTagsStr] = useState('');
+  const [executor, setExecutor] = useState<KanbanCardType['executor']>('native');
+  const [workdir, setWorkdir] = useState('');
 
   const submit = () => {
     if (!title.trim()) return;
@@ -140,7 +176,7 @@ export function CreateCardModal({
       .split(',')
       .map((t) => t.trim())
       .filter(Boolean);
-    onCreate(title.trim(), description, tags);
+    onCreate(title.trim(), description, tags, { executor, workdir: workdir.trim() });
   };
 
   return (
@@ -192,6 +228,38 @@ export function CreateCardModal({
           </label>
           <input id="card-tags" value={tagsStr} onChange={(e) => setTagsStr(e.target.value)} placeholder="coding, research" className="input" />
         </div>
+        <div>
+          <label className="label" htmlFor="card-executor">
+            Executor
+          </label>
+          <select
+            id="card-executor"
+            value={executor}
+            onChange={(e) => setExecutor(e.target.value as KanbanCardType['executor'])}
+            className="input"
+          >
+            <option value="native">Alita (native)</option>
+            <option value="opencode">OpenCode (external)</option>
+            <option value="claude_code">Claude Code (external)</option>
+          </select>
+        </div>
+        {executor !== 'native' && (
+          <div>
+            <label className="label" htmlFor="card-workdir">
+              Workdir (optional, inside the workspace)
+            </label>
+            <input
+              id="card-workdir"
+              value={workdir}
+              onChange={(e) => setWorkdir(e.target.value)}
+              placeholder="Empty = workspace root"
+              className="input font-mono text-[12px]"
+            />
+            <p className="mt-1 text-[10.5px] text-muted-2">
+              External cards run read-only unless a mandate is set on the card.
+            </p>
+          </div>
+        )}
       </div>
     </Modal>
   );

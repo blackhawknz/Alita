@@ -62,14 +62,17 @@ class KanbanExecutor:
     """
 
     def __init__(self, store: KanbanStore, subagent_manager: Any,
-                 max_concurrent: Optional[int] = None, away_state: Any = None):
+                 max_concurrent: Optional[int] = None, away_state: Any = None,
+                 external_manager: Any = None):
         self.store = store
         self.subagent_manager = subagent_manager
         self.away_state = away_state
+        self.external_manager = external_manager
         self.max_concurrent = max(1, max_concurrent) if max_concurrent else _max_concurrent_from_env()
         self._task: Optional[asyncio.Task] = None
         self._in_flight: Set[str] = set()
         self._card_tasks: Dict[str, asyncio.Task] = {}
+        self._external_runs: Dict[str, Dict[str, Any]] = {}
         self._cancelled: Set[str] = set()
         self._running = False
 
@@ -178,8 +181,15 @@ class KanbanExecutor:
     # ─── Single card execution ──────────────────────────────────────
 
     async def _execute_card(self, card: KanbanCard) -> None:
-        """Delegate a single card to the sub-agent manager and write back the result."""
+        """Delegate a single card and write back the result.
+
+        ``native`` cards keep the original Alita sub-agent path unchanged;
+        external cards are delegated through :class:`ExternalToolManager`.
+        """
         logger.info("KanbanExecutor: executing card %s [%s]", card.id, card.title)
+        if (card.executor or "native") != "native":
+            await self._execute_external_card(card)
+            return
         try:
             result = await self.subagent_manager.delegate(
                 task=card.description or card.title,
@@ -223,9 +233,142 @@ class KanbanExecutor:
             )
             logger.warning("KanbanExecutor: card %s raised: %s", card.id, exc)
         finally:
-            self._in_flight.discard(card.id)
-            self._card_tasks.pop(card.id, None)
-            self._cancelled.discard(card.id)
+            self._finish_card_tracking(card.id)
+
+    # ─── External execution ────────────────────────────────────────
+
+    def _finish_card_tracking(self, card_id: str) -> None:
+        self._in_flight.discard(card_id)
+        self._card_tasks.pop(card_id, None)
+        self._external_runs.pop(card_id, None)
+        self._cancelled.discard(card_id)
+
+    async def _interrupt_external(self, run: Optional[Dict[str, Any]]) -> None:
+        """Kill the CLI process behind an external card run."""
+        if not run:
+            return
+        executor = run.get("executor")
+        handle = run.get("handle")
+        interrupt = getattr(executor, "interrupt", None)
+        if handle and callable(interrupt):
+            try:
+                await interrupt(handle)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "KanbanExecutor: failed to interrupt external run %s", handle,
+                    exc_info=True,
+                )
+
+    async def _execute_external_card(self, card: KanbanCard) -> None:
+        """Run a card through an external executor and map its Report onto it."""
+        manager = self.external_manager
+        if manager is None:
+            self.store.update_card(
+                card.id,
+                status="failed",
+                error="external executor support is not configured",
+                completed_at=_now(),
+            )
+            self._finish_card_tracking(card.id)
+            return
+
+        # Never start a paid run while the user is away. Leave the card
+        # executable (idle) so it can resume when away mode ends.
+        if self._is_away():
+            self.store.update_card(card.id, status="idle", error="")
+            self._finish_card_tracking(card.id)
+            return
+
+        run_info: Dict[str, Any] = {}
+
+        def on_start(name: str, executor: Any, handle: str) -> None:
+            run_info.update(name=name, executor=executor, handle=handle)
+            self._external_runs[card.id] = dict(run_info)
+            run_id = ""
+            try:
+                run_id = manager.external_run_id(handle)
+            except Exception:  # noqa: BLE001
+                run_id = ""
+            if run_id:
+                self.store.update_card(card.id, external_run_id=run_id)
+
+        try:
+            result = await manager.delegate(
+                task=card.description or card.title,
+                executor=card.executor,
+                workdir=card.workdir or None,
+                mandate=card.mandate or None,
+                max_minutes=card.max_minutes,
+                on_start=on_start,
+            )
+            if card.id in self._cancelled:
+                return  # keep the 'Cancelled by user' state written by cancel_card()
+
+            result = result if isinstance(result, dict) else {}
+            report = result.get("report")
+            if not isinstance(report, dict):
+                report = {
+                    "kind": "ready" if result.get("success") else "failed",
+                    "summary": str(result.get("response") or result.get("error") or ""),
+                }
+            kind = str(report.get("kind") or "").lower()
+            handle = str(result.get("session_id") or run_info.get("handle") or "")
+
+            run_id = ""
+            if handle:
+                try:
+                    run_id = manager.external_run_id(handle)
+                except Exception:  # noqa: BLE001
+                    run_id = ""
+
+            fields: Dict[str, Any] = {
+                "execution_session_id": handle,
+                "result": report,
+                "completed_at": _now(),
+            }
+            if run_id:
+                fields["external_run_id"] = run_id
+
+            if kind == "waiting" and result.get("success", True):
+                question = (
+                    str(report.get("question") or "").strip()
+                    or str(report.get("summary") or "").strip()
+                    or f"{card.executor} is waiting for input"
+                )
+                fields.update(status="blocked", error=question)
+                self.store.update_card(card.id, **fields)
+                logger.info("KanbanExecutor: card %s is blocked (waiting)", card.id)
+            elif result.get("success") and kind not in ("failed", "error", "blocked", "dropped"):
+                fields.update(status="succeeded", error="")
+                self.store.update_card(card.id, **fields)
+                if card.auto_advance:
+                    self.store.move_card(card.id, "review")
+                logger.info("KanbanExecutor: card %s succeeded (external)", card.id)
+            else:
+                error = (
+                    str(result.get("error") or "").strip()
+                    or str(report.get("summary") or "").strip()
+                    or f"{card.executor} run failed"
+                )
+                fields.update(status="failed", error=error)
+                self.store.update_card(card.id, **fields)
+                logger.warning("KanbanExecutor: card %s failed: %s", card.id, error)
+        except asyncio.CancelledError:
+            error = CANCELLED_BY_USER if card.id in self._cancelled else "Execution cancelled (executor stopped)"
+            await self._interrupt_external(self._external_runs.get(card.id))
+            try:
+                self.store.update_card(card.id, status="failed", error=error, completed_at=_now())
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self.store.update_card(
+                card.id, status="failed", error=str(exc) or type(exc).__name__,
+                completed_at=_now(),
+            )
+            logger.warning("KanbanExecutor: external card %s raised: %s", card.id, exc)
+        finally:
+            self._finish_card_tracking(card.id)
 
     # ─── Manual control ─────────────────────────────────────────────
 
@@ -247,6 +390,16 @@ class KanbanExecutor:
             return False
         self._cancelled.add(card_id)
         self.store.update_card(card_id, status="failed", error=CANCELLED_BY_USER, completed_at=_now())
+
+        # An external CLI keeps burning money unless its process is killed.
+        external = self._external_runs.get(card_id)
+        if external:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._interrupt_external(dict(external)))
+            except RuntimeError:
+                pass  # no running loop (e.g. tests calling this synchronously)
+
         task = self._card_tasks.get(card_id)
         if task is not None and not task.done():
             task.cancel()
