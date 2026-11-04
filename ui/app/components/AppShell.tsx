@@ -16,10 +16,32 @@ import SystemView from './SystemView';
 import KanbanView from './KanbanView';
 import JobsView from './JobsView';
 import GalleryView from './GalleryView';
+import ActivityView from './ActivityView';
 import MobileTopBar from './MobileTopBar';
 
-export type View = 'chat' | 'persona' | 'memory' | 'skills' | 'board' | 'jobs' | 'gallery' | 'system' | 'settings';
-const VIEWS: View[] = ['chat', 'persona', 'memory', 'skills', 'board', 'jobs', 'gallery', 'system', 'settings'];
+export type View =
+  | 'chat'
+  | 'persona'
+  | 'memory'
+  | 'skills'
+  | 'board'
+  | 'jobs'
+  | 'activity'
+  | 'gallery'
+  | 'system'
+  | 'settings';
+const VIEWS: View[] = [
+  'chat',
+  'persona',
+  'memory',
+  'skills',
+  'board',
+  'jobs',
+  'activity',
+  'gallery',
+  'system',
+  'settings',
+];
 
 export interface SessionActions {
   rename: (id: string, title: string) => Promise<boolean>;
@@ -327,6 +349,7 @@ function Shell() {
           {view === 'skills' && <SkillsView />}
           {view === 'board' && <KanbanView />}
           {view === 'jobs' && <JobsView />}
+          {view === 'activity' && <ActivityView />}
           {view === 'gallery' && <GalleryView />}
           {view === 'system' && <SystemView health={health} onRefreshHealth={refreshHealth} onOpenSession={openSession} />}
           {view === 'settings' && <SettingsView onSaved={refreshHealth} />}

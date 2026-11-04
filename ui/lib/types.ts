@@ -558,3 +558,62 @@ export interface JobRun {
   completed_at: string;
   duration_ms: number;
 }
+
+// ─── Activity ──────────────────────────────────────────────────────
+
+export type ExternalRunStatus = 'running' | 'succeeded' | 'failed' | 'cancelled';
+
+export interface ActivityRun {
+  id: string;
+  handle: string | null;
+  executor: string;
+  workdir: string;
+  task_summary: string;
+  status: ExternalRunStatus;
+  started_at: string;
+  finished_at: string | null;
+  elapsed_ms: number;
+  duration_ms: number | null;
+  cost: number;
+  tool_calls: number;
+  last_activity: string | null;
+  error: string | null;
+  result_summary: string | null;
+}
+
+export interface ActivityApproval extends PendingApproval {
+  type: 'approval';
+}
+
+export interface ActivityAttentionRun extends ActivityRun {
+  type: 'run';
+}
+
+export type ActivityAttention = ActivityAttentionRun | ActivityApproval;
+
+export interface ActivitySpend {
+  today: number;
+  month_to_date: number;
+  projected_month: number;
+  executor_today: number;
+  currency: string;
+  executor_per_run_cap: number;
+  executor_daily_cap: number;
+}
+
+export interface ActivityResponse {
+  running: ActivityRun[];
+  recent: ActivityRun[];
+  needs_attention: ActivityAttention[];
+  spend: ActivitySpend;
+  counts: {
+    running: number;
+    failed_24h: number;
+    pending_approvals: number;
+  };
+}
+
+export interface ActivityRunDetail {
+  run: ActivityRun & { error?: string | null };
+  log_tail: string | null;
+}

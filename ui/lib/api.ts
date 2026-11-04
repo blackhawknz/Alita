@@ -2,6 +2,8 @@
 // rewrite `/api/:path*` -> backend.
 
 import type {
+  ActivityResponse,
+  ActivityRunDetail,
   ChatRequest,
   ConnectionTest,
   GalleryImage,
@@ -402,6 +404,13 @@ export async function getJobRuns(jobId: string, limit = 20): Promise<JobRun[]> {
   const data = await request<{ runs: JobRun[] }>(`/jobs/${jobId}/runs${qs({ limit })}`);
   return data.runs || [];
 }
+
+// ─── Activity ──────────────────────────────────────────────────────
+
+export const getActivity = () => request<ActivityResponse>('/activity');
+
+export const getActivityRun = (runId: string) =>
+  request<ActivityRunDetail>(`/activity/runs/${encodeURIComponent(runId)}`);
 
 export function errorMessage(err: unknown): string {
   if (err instanceof ApiError) return err.detail || err.message;

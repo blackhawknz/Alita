@@ -19,13 +19,15 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+
+STALE_RUN_ERROR = "stale: process ended without reporting"
 
 SESSION_KINDS = ("chat", "job", "subagent", "kanban")
 
@@ -261,6 +263,172 @@ class SQLiteStore:
             (str(executor),),
         )
 
+    # ─── External executor runs ──────────────────────────────────
+
+    _EXTERNAL_RUN_COLUMNS = (
+        "handle", "executor", "workdir", "task_summary", "status",
+        "started_at", "finished_at", "duration_ms", "cost", "tool_calls",
+        "last_activity", "error", "result_summary",
+    )
+
+    def start_external_run(
+        self,
+        run_id: str,
+        executor: str,
+        workdir: str,
+        task_summary: str,
+        *,
+        handle: Optional[str] = None,
+        started_at: Optional[str] = None,
+    ) -> None:
+        """Insert a delegated run in the ``running`` state."""
+        with self.tx() as conn:
+            conn.execute(
+                "INSERT INTO external_runs "
+                "(id, handle, executor, workdir, task_summary, status, started_at) "
+                "VALUES (?, ?, ?, ?, ?, 'running', ?)",
+                (
+                    str(run_id),
+                    str(handle) if handle else None,
+                    str(executor),
+                    str(workdir),
+                    str(task_summary or "")[:200],
+                    started_at or self._iso_now(),
+                ),
+            )
+
+    def update_external_run(self, run_id: str, **fields: Any) -> None:
+        """Update allowlisted columns of one run (no-op when nothing matches)."""
+        sets, params = [], []
+        for key, value in fields.items():
+            if key not in self._EXTERNAL_RUN_COLUMNS:
+                continue
+            sets.append(f"{key} = ?")
+            params.append(value)
+        if not sets:
+            return
+        params.append(str(run_id))
+        with self.tx() as conn:
+            conn.execute(
+                f"UPDATE external_runs SET {', '.join(sets)} WHERE id = ?",
+                tuple(params),
+            )
+
+    def record_external_run_activity(
+        self,
+        run_id: str,
+        *,
+        tool_calls: int = 0,
+        cost: float = 0.0,
+        last_activity: Optional[str] = None,
+    ) -> None:
+        """Increment counters and optionally set the last observed activity."""
+        sets, params = [], []
+        if tool_calls:
+            sets.append("tool_calls = tool_calls + ?")
+            params.append(int(tool_calls))
+        if cost:
+            sets.append("cost = cost + ?")
+            params.append(float(cost))
+        if last_activity is not None:
+            sets.append("last_activity = ?")
+            params.append(str(last_activity)[:200])
+        if not sets:
+            return
+        params.append(str(run_id))
+        with self.tx() as conn:
+            conn.execute(
+                f"UPDATE external_runs SET {', '.join(sets)} WHERE id = ?",
+                tuple(params),
+            )
+
+    def finish_external_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        error: Optional[str] = None,
+        result_summary: Optional[str] = None,
+        duration_ms: Optional[int] = None,
+        finished_at: Optional[str] = None,
+        cost: float = 0.0,
+    ) -> None:
+        """Close a run, optionally adding cost and deriving ``duration_ms``."""
+        now = finished_at or self._iso_now()
+        sets = ["status = ?", "finished_at = ?", "error = ?", "result_summary = ?"]
+        params: List[Any] = [str(status), now, error, result_summary]
+        if duration_ms is None:
+            # SQLite computes the interval so callers need not parse timestamps.
+            sets.append(
+                "duration_ms = CAST((julianday(?) - julianday(started_at)) * 86400000 AS INTEGER)"
+            )
+            params.append(now)
+        else:
+            sets.append("duration_ms = ?")
+            params.append(int(duration_ms))
+        if cost:
+            sets.append("cost = cost + ?")
+            params.append(float(cost))
+        params.append(str(run_id))
+        with self.tx() as conn:
+            conn.execute(
+                f"UPDATE external_runs SET {', '.join(sets)} WHERE id = ?",
+                tuple(params),
+            )
+
+    def get_external_run(self, run_id: str) -> Optional[Dict[str, Any]]:
+        return self.query_one("SELECT * FROM external_runs WHERE id = ?", (str(run_id),))
+
+    def list_external_runs(
+        self,
+        *,
+        status: Optional[str] = None,
+        statuses: Optional[Sequence[str]] = None,
+        limit: int = 20,
+        since: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List runs newest first, optionally filtered by status/time."""
+        where: List[str] = []
+        params: List[Any] = []
+        if status is not None:
+            where.append("status = ?")
+            params.append(str(status))
+        if statuses:
+            where.append(f"status IN ({','.join('?' for _ in statuses)})")
+            params.extend(str(s) for s in statuses)
+        if since:
+            where.append("COALESCE(finished_at, started_at) >= ?")
+            params.append(str(since))
+        clause = f" WHERE {' AND '.join(where)}" if where else ""
+        params.append(int(limit))
+        return self.query(
+            f"SELECT * FROM external_runs{clause} "
+            "ORDER BY started_at DESC, rowid DESC LIMIT ?",
+            tuple(params),
+        )
+
+    def sweep_stale_external_runs(
+        self,
+        hours: float = 2.0,
+        *,
+        now: Optional[datetime] = None,
+    ) -> int:
+        """Mark long-stuck ``running`` rows as failed; returns rows changed."""
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        cutoff = (current - timedelta(hours=float(hours))).isoformat()
+        now_iso = current.isoformat()
+        with self.tx() as conn:
+            cur = conn.execute(
+                "UPDATE external_runs SET status = 'failed', error = ?, "
+                "finished_at = ?, "
+                "duration_ms = CAST((julianday(?) - julianday(started_at)) * 86400000 AS INTEGER) "
+                "WHERE status = 'running' AND started_at < ?",
+                (STALE_RUN_ERROR, now_iso, now_iso, cutoff),
+            )
+            return cur.rowcount
+
     # ─── Key/value application settings ──────────────────────────
 
     def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
@@ -382,6 +550,24 @@ class SQLiteStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_external_handles_executor
                     ON external_handles(executor, updated_at);
+                CREATE TABLE IF NOT EXISTS external_runs (
+                    id            TEXT PRIMARY KEY,
+                    handle        TEXT,
+                    executor      TEXT NOT NULL,
+                    workdir       TEXT NOT NULL,
+                    task_summary  TEXT NOT NULL,
+                    status        TEXT NOT NULL,
+                    started_at    TEXT NOT NULL,
+                    finished_at   TEXT,
+                    duration_ms   INTEGER,
+                    cost          REAL DEFAULT 0.0,
+                    tool_calls    INTEGER DEFAULT 0,
+                    last_activity TEXT,
+                    error         TEXT,
+                    result_summary TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_external_runs_started
+                    ON external_runs(started_at DESC);
                 """
             )
             # Columns added in schema v2 (idempotent for old databases).

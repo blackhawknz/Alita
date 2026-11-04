@@ -17,7 +17,7 @@ import mimetypes
 import os
 import re
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
@@ -338,6 +338,137 @@ async def usage_for_session(session_id: str, limit: int = Query(500, ge=1, le=50
         (session_id, int(limit)),
     )
     return {"session_id": session_id, "events": rows, "count": len(rows)}
+
+
+# ─── Activity ─────────────────────────────────────────────────────────
+
+def _parse_iso(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _activity_run(row: Dict[str, Any], now: datetime) -> Dict[str, Any]:
+    """Shape one ``external_runs`` row for the activity panel."""
+    started = _parse_iso(row.get("started_at"))
+    duration = row.get("duration_ms")
+    if duration is None and started is not None:
+        end = _parse_iso(row.get("finished_at")) or now
+        duration = max(0, int((end - started).total_seconds() * 1000))
+    return {
+        "id": row.get("id"),
+        "handle": row.get("handle"),
+        "executor": row.get("executor"),
+        "workdir": row.get("workdir"),
+        "task_summary": row.get("task_summary"),
+        "status": row.get("status"),
+        "started_at": row.get("started_at"),
+        "finished_at": row.get("finished_at"),
+        "elapsed_ms": duration,
+        "duration_ms": row.get("duration_ms"),
+        "cost": float(row.get("cost") or 0.0),
+        "tool_calls": int(row.get("tool_calls") or 0),
+        "last_activity": row.get("last_activity"),
+        "error": row.get("error"),
+        "result_summary": row.get("result_summary"),
+    }
+
+
+@app.get("/activity")
+async def activity():
+    agent = get_agent()
+    db = agent.sqlite
+    now = datetime.now(timezone.utc)
+    day_ago = (now - timedelta(hours=24)).isoformat()
+
+    running_rows = db.list_external_runs(status="running", limit=100)
+    recent_rows = db.list_external_runs(
+        statuses=("succeeded", "failed", "cancelled"), limit=20
+    )
+    attention_rows = db.list_external_runs(
+        statuses=("failed", "cancelled"), limit=50, since=day_ago
+    )
+    running = [_activity_run(r, now) for r in running_rows]
+    recent = [_activity_run(r, now) for r in recent_rows]
+
+    pending = agent.approval_coordinator.list_pending()
+    needs_attention: List[Dict[str, Any]] = [
+        {**_activity_run(row, now), "type": "run"} for row in attention_rows
+    ]
+    for item in pending:
+        needs_attention.append({**item, "type": "approval"})
+
+    now_local = datetime.now().astimezone()
+    month_start = pricing.month_start_utc(now_local).strftime("%Y-%m-%d %H:%M:%S")
+    today_start = (
+        datetime(now_local.year, now_local.month, now_local.day, tzinfo=now_local.tzinfo)
+        .astimezone(timezone.utc)
+        .strftime("%Y-%m-%d %H:%M:%S")
+    )
+    today_events = db.query(
+        "SELECT source, model, prompt_tokens, completion_tokens, cached_tokens, "
+        "created_at FROM usage_events WHERE created_at >= ?",
+        (today_start,),
+    )
+    month_events = db.query(
+        "SELECT source, model, prompt_tokens, completion_tokens, cached_tokens, "
+        "created_at FROM usage_events WHERE created_at >= ?",
+        (month_start,),
+    )
+    month_spend = pricing.summarize_spend(month_events, now=now_local)
+    executor_row = db.query_one(
+        "SELECT COALESCE(SUM(cost), 0) AS cost FROM executor_spend WHERE date = ?",
+        (now_local.date().isoformat(),),
+    ) or {}
+    failed_24h = db.query_one(
+        "SELECT COUNT(*) AS n FROM external_runs WHERE status = 'failed' "
+        "AND COALESCE(finished_at, started_at) >= ?",
+        (day_ago,),
+    ) or {}
+
+    spend = {
+        "today": round(pricing.events_cost(today_events), 6),
+        "month_to_date": month_spend["month_to_date"],
+        "projected_month": month_spend["projected_month"],
+        "executor_today": round(float(executor_row.get("cost") or 0.0), 6),
+        "currency": "USD",
+        "executor_per_run_cap": float(
+            getattr(agent.settings, "executor_max_cost", 0.0) or 0.0
+        ),
+        "executor_daily_cap": float(
+            getattr(agent.settings, "executor_daily_cost", 0.0) or 0.0
+        ),
+    }
+
+    return {
+        "running": running,
+        "recent": recent,
+        "needs_attention": needs_attention,
+        "spend": spend,
+        "counts": {
+            "running": len(running),
+            "failed_24h": int(failed_24h.get("n") or 0),
+            "pending_approvals": agent.approval_coordinator.pending_count,
+        },
+    }
+
+
+@app.get("/activity/runs/{run_id}")
+async def activity_run(run_id: str):
+    row = get_agent().sqlite.get_external_run(run_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    shaped = _activity_run(row, datetime.now(timezone.utc))
+    return {
+        "run": {**row, "elapsed_ms": shaped["elapsed_ms"]},
+        "log_tail": None,
+    }
 
 
 # ─── Chat ─────────────────────────────────────────────────────────────
