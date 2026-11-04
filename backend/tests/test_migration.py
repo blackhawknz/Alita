@@ -57,6 +57,23 @@ def test_v1_database_is_cleaned_up(tmp_path):
     again.close()
 
 
+def test_existing_database_gains_external_handles_without_data_loss(tmp_path):
+    path = str(tmp_path / "state.db")
+    _make_v1_db(path)
+
+    store = SQLiteStore(path)
+    store.save_external_handle("ses_1", "opencode", str(tmp_path), cost=0.2)
+    record = store.load_external_handle("ses_1")
+    assert record["cost"] == 0.2
+    # Pre-existing rows are untouched by the additive table.
+    assert len(store.load_messages("chat1")) == 2
+    store.close()
+
+    reopened = SQLiteStore(path)
+    assert reopened.load_external_handle("ses_1")["cost"] == 0.2
+    reopened.close()
+
+
 def test_clean_legacy_persona_strips_generated_sections():
     text = (
         "You are Alita.\n\n## Core Principles\n- Be kind\n\n## Memory Usage\n- generated\n\n"

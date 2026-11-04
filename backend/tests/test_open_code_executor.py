@@ -12,6 +12,9 @@ from pathlib import Path
 import pytest
 
 from alita.executors import OpenCodeExecutor
+from alita.executors.opencode import _Run
+from alita.memory.sqlite_store import SQLiteStore
+from alita.tools.external import ExternalToolManager
 
 FAKE_SCRIPT = r'''
 import json, os, sys, time
@@ -37,6 +40,16 @@ if mode == "fail":
 
 if mode == "hang":
     time.sleep(60)
+    sys.exit(0)
+
+if mode == "silent":
+    sys.exit(0)
+
+if mode == "authfail":
+    emit({"type": "error", "sessionID": session,
+          "error": {"name": "ProviderAuthError",
+                    "data": {"providerID": "google",
+                             "message": "Google Generative AI API key is missing"}}})
     sys.exit(0)
 
 emit({"type": "tool_use", "sessionID": session,
@@ -214,6 +227,132 @@ def test_missing_binary_raises():
         OpenCodeExecutor(binary="definitely-not-opencode-xyz")
 
 
+def test_error_event_is_mapped_with_real_message(fake_binary):
+    executor = OpenCodeExecutor(binary=fake_binary, default_model="test/model")
+    run = _Run(handle="temp")
+    raw = json.dumps(
+        {
+            "type": "error",
+            "sessionID": "ses_auth",
+            "error": {
+                "name": "ProviderAuthError",
+                "data": {
+                    "providerID": "google",
+                    "message": "Google Generative AI API key is missing",
+                },
+            },
+        }
+    )
+    event = executor._map_line(raw, run)
+
+    assert event is not None
+    assert event.kind == "error"
+    assert "ProviderAuthError" in event.text
+    assert "Google Generative AI API key is missing" in event.text
+    assert run.session_id == "ses_auth"
+
+
+async def test_silent_run_is_an_error_not_a_success(fake_binary, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_OPENCODE_MODE", "silent")
+    executor = OpenCodeExecutor(binary=fake_binary, default_model="test/model", timeout=10)
+    handle = await executor.start("do nothing", workdir=tmp_path)
+    try:
+        events = await _collect(executor.send(handle, ""))
+    finally:
+        await executor.close(handle)
+
+    errors = [event for event in events if event.kind == "error"]
+    assert errors
+    assert any("no output" in event.text for event in errors)
+
+
+async def test_provider_error_surfaces_as_a_failed_report(
+    fake_binary, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("FAKE_OPENCODE_MODE", "authfail")
+    executor = OpenCodeExecutor(binary=fake_binary, default_model="test/model", timeout=10)
+    manager = ExternalToolManager(
+        settings=_PersistSettings(),
+        workspace=tmp_path,
+        executors={"opencode": executor},
+    )
+
+    result = await manager.delegate("do the work", workdir=str(tmp_path))
+
+    assert result["success"] is False
+    assert "ProviderAuthError" in result["error"]
+    assert "Google Generative AI API key is missing" in result["error"]
+    assert result["report"]["kind"] == "failed"
+    assert result["response"] == ""
+
+
+def test_argv_includes_model_and_variant(fake_binary, tmp_path):
+    executor = OpenCodeExecutor(
+        binary=fake_binary,
+        default_model="deepseek/deepseek-flash",
+        variant="high",
+    )
+    argv = executor._argv(workdir=tmp_path, session_id=None, prompt="hi")
+    assert argv[argv.index("-m") + 1] == "deepseek/deepseek-flash"
+    assert argv[argv.index("--variant") + 1] == "high"
+
+
+class _PersistSettings:
+    executor_allowed_roots = ""
+    executor_max_cost = 0.0
+    executor_daily_cost = 0.0
+    executor_allow_skip_permissions = False
+    executor_opencode_model = "test/model"
+    executor_opencode_variant = ""
+    away_mode = False
+
+
+async def test_handles_persist_across_manager_restart(fake_binary, tmp_path):
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    db = str(tmp_path / "state.db")
+
+    store1 = SQLiteStore(db)
+    executor1 = OpenCodeExecutor(
+        binary=fake_binary, default_model="test/model", timeout=10, store=store1
+    )
+    manager1 = ExternalToolManager(
+        settings=_PersistSettings(),
+        workspace=ws,
+        sqlite=store1,
+        executors={"opencode": executor1},
+    )
+    first = await manager1.delegate("say PONG", workdir=str(ws))
+    assert first["success"] is True, first
+    handle = first["session_id"]
+    assert handle.startswith("ses_fake_")
+
+    record = store1.load_external_handle(handle)
+    assert record is not None
+    assert record["executor"] == "opencode"
+    assert Path(record["workdir"]).resolve() == ws.resolve()
+    assert record["cost"] == pytest.approx(0.001)
+    store1.close()
+
+    # Simulate a restart: new process => new store, executor and manager.
+    store2 = SQLiteStore(db)
+    executor2 = OpenCodeExecutor(
+        binary=fake_binary, default_model="test/model", timeout=10, store=store2
+    )
+    manager2 = ExternalToolManager(
+        settings=_PersistSettings(),
+        workspace=ws,
+        sqlite=store2,
+        executors={"opencode": executor2},
+    )
+    second = await manager2.answer(handle, "what did you say?")
+    assert second["success"] is True, second
+    assert "RESUMED" in second["response"]
+    # Rehydrated cost is preserved and the follow-up cost is added on top.
+    assert executor2.handle_cost(handle) == pytest.approx(0.002)
+    store2.close()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="PowerShell shim is a Windows concern")
 def test_ps1_binary_is_invoked_through_powershell(monkeypatch, tmp_path):
     ps1 = tmp_path / "opencode.ps1"
@@ -254,3 +393,47 @@ async def test_real_opencode_pong_and_resume(tmp_path):
         assert "PONG" in second_text.upper()
     finally:
         await executor.close(handle)
+
+
+@pytest.mark.skipif(
+    not (shutil.which("opencode") and os.environ.get("ALITA_OPENCODE_INTEGRATION") == "1"),
+    reason="set ALITA_OPENCODE_INTEGRATION=1 (and install opencode) to run the real CLI",
+)
+async def test_real_cli_delegate_and_resume_through_manager(tmp_path):
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    db = str(tmp_path / "state.db")
+
+    store1 = SQLiteStore(db)
+    executor1 = OpenCodeExecutor(
+        default_model="deepseek/deepseek-flash", timeout=180, store=store1
+    )
+    manager1 = ExternalToolManager(
+        settings=_PersistSettings(),
+        workspace=ws,
+        sqlite=store1,
+        executors={"opencode": executor1},
+    )
+    first = await manager1.delegate(
+        "Reply with exactly the word PONG and nothing else.", workdir=str(ws)
+    )
+    assert first["success"] is True, first
+    assert first["response"].strip()
+    assert first["cost"] > 0
+    handle = first["session_id"]
+    store1.close()
+
+    store2 = SQLiteStore(db)
+    executor2 = OpenCodeExecutor(
+        default_model="deepseek/deepseek-flash", timeout=180, store=store2
+    )
+    manager2 = ExternalToolManager(
+        settings=_PersistSettings(),
+        workspace=ws,
+        sqlite=store2,
+        executors={"opencode": executor2},
+    )
+    second = await manager2.answer(handle, "What word did you just say?")
+    assert second["success"] is True, second
+    assert "PONG" in second["response"].upper()
+    store2.close()

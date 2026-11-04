@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import pytest
 
 from alita.executors.base import ExecutorEvent
 from alita.executors.report import Report
+from alita.memory.sqlite_store import SQLiteStore
 from alita.tools.external import (
     ANSWER_EXTERNAL_TOOL_SCHEMA,
     DELEGATE_EXTERNAL_TOOL_SCHEMA,
@@ -79,6 +81,72 @@ def _happy_events(summary: str = '```report\n{"kind": "ready", "summary": "done"
         ExecutorEvent(kind="text", text=summary),
         ExecutorEvent(kind="done", data={"reason": "stop"}, cost=0.1),
     ]
+
+
+class Settings:
+    """Settings stub covering every external-executor knob."""
+
+    executor_allowed_roots = ""
+    executor_max_cost = 0.5
+    executor_daily_cost = 5.0
+    executor_allow_skip_permissions = False
+    executor_opencode_model = "deepseek/deepseek-flash"
+    executor_opencode_variant = "high"
+    away_mode = False
+
+
+class RecordingOpenCodeExecutor:
+    """Fake executor built by the *real* lazy-registration path."""
+
+    name = "opencode"
+    instances = []
+
+    def __init__(
+        self,
+        *,
+        binary=None,
+        default_model=None,
+        variant=None,
+        timeout=1800.0,
+        extra_args=None,
+        store=None,
+    ):
+        self.binary = binary
+        self.default_model = default_model
+        self.variant = variant
+        self.timeout = timeout
+        self.extra_args = list(extra_args or [])
+        self.store = store
+        self.started = []
+        self.sent = []
+        self.interrupted = []
+        self._handles = set()
+        RecordingOpenCodeExecutor.instances.append(self)
+
+    async def start(self, task, *, mandate=None, workdir=None):
+        self.started.append((task, Path(workdir) if workdir is not None else None))
+        self._handles.add("ses_recording")
+        return "ses_recording"
+
+    async def send(self, handle, message):
+        self.sent.append((handle, message))
+        yield ExecutorEvent(
+            kind="text",
+            text='```report\n{"kind": "ready", "summary": "resumed"}\n```',
+        )
+        yield ExecutorEvent(kind="done", data={"reason": "stop"}, cost=0.02)
+
+    async def interrupt(self, handle):
+        self.interrupted.append(handle)
+
+    async def close(self, handle):
+        self._handles.discard(handle)
+
+    def has_handle(self, handle):
+        return handle in self._handles
+
+    def handle_cost(self, handle):
+        return 0.0
 
 
 def _manager(agent, executor=None):
@@ -331,3 +399,133 @@ def test_skip_permissions_is_off_by_default():
     assert ExternalToolManager(settings=Allowed(), executors={})._opencode_extra_args() == [
         "--dangerously-skip-permissions"
     ]
+
+
+# ─── Real construction path / registry identity ─────────────────────
+
+
+def test_registry_is_memoised_without_agent_executors(tmp_path):
+    class BareAgent:
+        workspace_dir = tmp_path
+
+        def __init__(self):
+            self.settings = Settings()
+
+    manager = ExternalToolManager(BareAgent())
+    first = manager._registry()
+    second = manager._registry()
+    assert first is second
+
+    first["opencode"] = object()
+    assert manager._registry()["opencode"] is first["opencode"]
+
+
+def test_registry_uses_the_agents_executor_dict(agent):
+    manager = ExternalToolManager(agent)
+    assert manager._registry() is agent.executors
+
+
+def test_delegate_then_answer_without_injecting_a_registry(agent, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "alita.executors.opencode.OpenCodeExecutor", RecordingOpenCodeExecutor
+    )
+    RecordingOpenCodeExecutor.instances.clear()
+    agent.executors.pop("opencode", None)
+
+    ws = tmp_path / "workspace"
+    ws.mkdir(exist_ok=True)
+    manager = ExternalToolManager(agent, workspace=ws)
+
+    first = asyncio.run(manager.delegate("do the work", workdir=str(ws)))
+    assert first["success"] is True, first
+    assert first["session_id"] == "ses_recording"
+    assert len(RecordingOpenCodeExecutor.instances) == 1
+
+    executor = RecordingOpenCodeExecutor.instances[0]
+    assert executor.default_model
+    assert executor.default_model == Settings.executor_opencode_model
+    assert executor.variant == Settings.executor_opencode_variant
+    assert executor.store is agent.sqlite
+
+    second = asyncio.run(manager.answer(first["session_id"], "follow up"))
+    assert second["success"] is True, second
+    assert second["report"]["summary"] == "resumed"
+
+
+def test_missing_opencode_model_fails_loudly(tmp_path):
+    class NoModel(Settings):
+        executor_opencode_model = ""
+
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    manager = ExternalToolManager(settings=NoModel(), workspace=ws, executors={})
+
+    result = asyncio.run(manager.delegate("do the work", workdir=str(ws)))
+    assert result["success"] is False
+    assert "no model" in result["error"].lower()
+
+
+def test_zero_output_run_is_a_failed_report(tmp_path):
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    fake = FakeExternalExecutor([ExecutorEvent(kind="status", text="working")])
+    manager = ExternalToolManager(
+        settings=Settings(), workspace=ws, executors={"opencode": fake}
+    )
+
+    result = asyncio.run(manager.delegate("do the work", workdir=str(ws)))
+    assert result["success"] is False
+    assert "produced no output" in result["error"]
+    assert result["report"]["kind"] == "failed"
+
+
+# ─── Persisted handles ──────────────────────────────────────────────
+
+
+def test_external_handle_store_round_trip(tmp_path):
+    store = SQLiteStore(str(tmp_path / "state.db"))
+    workdir1 = tmp_path / "one"
+    workdir2 = tmp_path / "two"
+    workdir1.mkdir()
+    workdir2.mkdir()
+
+    store.save_external_handle("ses_1", "opencode", str(workdir1), cost=0.5)
+    record = store.load_external_handle("ses_1")
+    assert record["executor"] == "opencode"
+    assert record["workdir"] == str(workdir1)
+    assert record["cost"] == pytest.approx(0.5)
+    assert record["created_at"] and record["updated_at"]
+
+    store.save_external_handle("ses_1", "opencode", str(workdir2), cost=0.75)
+    record = store.load_external_handle("ses_1")
+    assert record["workdir"] == str(workdir2)
+    assert record["cost"] == pytest.approx(0.75)
+
+    # Omitting cost preserves the cumulative value.
+    store.save_external_handle("ses_1", "opencode", str(workdir2))
+    assert store.load_external_handle("ses_1")["cost"] == pytest.approx(0.75)
+
+    handles = store.list_external_handles("opencode")
+    assert [row["handle"] for row in handles] == ["ses_1"]
+    assert store.list_external_handles("claude_code") == []
+    store.close()
+
+
+def test_stored_handle_outside_allowed_roots_is_rejected(tmp_path):
+    ws = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    ws.mkdir()
+    outside.mkdir()
+
+    store = SQLiteStore(str(tmp_path / "state.db"))
+    store.save_external_handle("ses_outside", "opencode", str(outside))
+    fake = FakeExternalExecutor(_happy_events())
+    manager = ExternalToolManager(
+        settings=Settings(), workspace=ws, sqlite=store, executors={"opencode": fake}
+    )
+
+    result = asyncio.run(manager.answer("ses_outside", "hello"))
+    assert result["success"] is False
+    assert "allowed roots" in result["error"]
+    assert fake.sent == []
+    store.close()

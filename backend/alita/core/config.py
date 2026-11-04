@@ -145,6 +145,15 @@ class AgentSettings:
         self.executor_daily_cost = env_float("ALITA_EXECUTOR_DAILY_COST", 5.00)
         self.executor_allow_skip_permissions = env_bool("ALITA_EXECUTOR_ALLOW_SKIP_PERMISSIONS", False)
         self.executor_allowed_roots = _env("ALITA_EXECUTOR_ALLOWED_ROOTS", "")
+        # OpenCode must always be given an explicit model: its own default may
+        # point at a provider with no API key. The variant is the provider's
+        # reasoning effort (passed through as ``--variant``).
+        self.executor_opencode_model = _env(
+            "ALITA_EXECUTOR_OPENCODE_MODEL", "deepseek/deepseek-flash"
+        ).strip()
+        self.executor_opencode_variant = _env(
+            "ALITA_EXECUTOR_OPENCODE_VARIANT", "high"
+        ).strip()
         # Away mode: pause autonomous work while the user is away. Chat always works.
         self.away_mode = env_bool("ALITA_AWAY_MODE", False)
         self.away_auto_after_hours = env_int("ALITA_AUTO_AWAY_AFTER_HOURS", 0)

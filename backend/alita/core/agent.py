@@ -227,7 +227,12 @@ class AlitaAgent:
             extra_args: List[str] = []
             if self.settings.executor_allow_skip_permissions:
                 extra_args.append("--dangerously-skip-permissions")
-            self.executors["opencode"] = OpenCodeExecutor(extra_args=extra_args)
+            self.executors["opencode"] = OpenCodeExecutor(
+                default_model=self.settings.executor_opencode_model or None,
+                variant=self.settings.executor_opencode_variant or None,
+                extra_args=extra_args,
+                store=self.sqlite,
+            )
         except RuntimeError as exc:
             logger.warning("OpenCode executor unavailable: %s", exc)
         except Exception as exc:  # noqa: BLE001

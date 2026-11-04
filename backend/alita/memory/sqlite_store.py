@@ -19,7 +19,7 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 
@@ -170,6 +170,80 @@ class SQLiteStore:
         )
         return float(row["cost"]) if row else 0.0
 
+    # ─── External executor handles ───────────────────────────────
+
+    @staticmethod
+    def _iso_now() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def save_external_handle(
+        self,
+        handle: str,
+        executor: str,
+        workdir: str,
+        *,
+        cost: Optional[float] = None,
+    ) -> None:
+        """Insert or update the record needed to resume an external session.
+
+        ``cost`` is the handle's cumulative spend; when omitted the stored
+        value is preserved.
+        """
+        handle = str(handle or "").strip()
+        if not handle:
+            return
+        now = self._iso_now()
+        with self.tx() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM external_handles WHERE handle = ?", (handle,)
+            ).fetchone()
+            if exists:
+                if cost is None:
+                    conn.execute(
+                        "UPDATE external_handles SET executor = ?, workdir = ?, "
+                        "updated_at = ? WHERE handle = ?",
+                        (str(executor), str(workdir), now, handle),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE external_handles SET executor = ?, workdir = ?, "
+                        "updated_at = ?, cost = ? WHERE handle = ?",
+                        (str(executor), str(workdir), now, float(cost), handle),
+                    )
+            else:
+                conn.execute(
+                    "INSERT INTO external_handles "
+                    "(handle, executor, workdir, created_at, updated_at, cost) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        handle,
+                        str(executor),
+                        str(workdir),
+                        now,
+                        now,
+                        float(cost or 0.0),
+                    ),
+                )
+
+    def load_external_handle(self, handle: str) -> Optional[Dict[str, Any]]:
+        """Return the stored record for ``handle``, or ``None``."""
+        return self.query_one(
+            "SELECT * FROM external_handles WHERE handle = ?", (str(handle),)
+        )
+
+    def list_external_handles(
+        self, executor: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """List stored external handles, newest first, optionally per executor."""
+        if executor is None:
+            return self.query(
+                "SELECT * FROM external_handles ORDER BY updated_at DESC"
+            )
+        return self.query(
+            "SELECT * FROM external_handles WHERE executor = ? ORDER BY updated_at DESC",
+            (str(executor),),
+        )
+
     # ─── Key/value application settings ──────────────────────────
 
     def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
@@ -280,6 +354,16 @@ class SQLiteStore:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL DEFAULT ''
                 );
+                CREATE TABLE IF NOT EXISTS external_handles (
+                    handle TEXT PRIMARY KEY,
+                    executor TEXT NOT NULL,
+                    workdir TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    cost REAL NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_external_handles_executor
+                    ON external_handles(executor, updated_at);
                 """
             )
             # Columns added in schema v2 (idempotent for old databases).
