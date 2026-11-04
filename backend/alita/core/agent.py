@@ -33,6 +33,7 @@ from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optiona
 
 from . import config
 from .approval import ApprovalCoordinator, ApprovalPolicy
+from .away import AwayState
 from .attachments import resolve_for_llm
 from .context import build_payload, estimate_tokens, hard_trim, plan_compaction, render_transcript, summarise
 from .prompt_builder import PromptBuilder, clean_legacy_persona
@@ -193,8 +194,11 @@ class AlitaAgent:
         self.tool_registry.register(make_answer_subagent_tool(self.subagent_manager))
         self.tool_registry.register(make_delegate_external_tool(self.external_tools))
         self.tool_registry.register(make_answer_external_tool(self.external_tools))
+        self.away_state = AwayState(self.sqlite, lambda: self.settings)
         self.kanban_store = KanbanStore(str(self.sqlite.db_path))
-        self.kanban_executor = KanbanExecutor(self.kanban_store, self.subagent_manager)
+        self.kanban_executor = KanbanExecutor(
+            self.kanban_store, self.subagent_manager, away_state=self.away_state,
+        )
         self.tool_registry.register(make_kanban_tool(self.kanban_store))
         self.scheduler_store = SchedulerStore(str(self.sqlite.db_path))
         self.scheduler_service = SchedulerService(self, self.scheduler_store)

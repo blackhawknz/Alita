@@ -26,7 +26,7 @@ from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse,
 from pydantic import BaseModel, Field
 
 from .. import __version__
-from ..core import config
+from ..core import config, pricing
 from ..core.agent import AlitaAgent
 from ..core.attachments import build_user_content, get_upload, save_upload
 from ..core.session import Session
@@ -307,6 +307,14 @@ async def usage_summary(
         " GROUP BY model ORDER BY prompt_tokens DESC",
         params,
     )
+    now_local = datetime.now().astimezone()
+    month_start = pricing.month_start_utc(now_local).strftime("%Y-%m-%d %H:%M:%S")
+    spend_events = db.query(
+        "SELECT source, model, prompt_tokens, completion_tokens, cached_tokens, created_at "
+        "FROM usage_events WHERE created_at >= ?",
+        (month_start,),
+    )
+    spend = pricing.summarize_spend(spend_events, now=now_local)
     return {
         "since": since_sql,
         "until": until_sql,
@@ -318,6 +326,7 @@ async def usage_summary(
         },
         "by_day": by_day,
         "by_model": by_model,
+        "spend": spend,
     }
 
 
@@ -892,6 +901,8 @@ class JobCreate(BaseModel):
     cron_expr: str
     enabled: bool = True
     timezone: str = ""
+    max_runs_per_week: int = 0
+    max_cost_per_run: float = 0.0
 
 
 class JobUpdate(BaseModel):
@@ -901,6 +912,15 @@ class JobUpdate(BaseModel):
     cron_expr: Optional[str] = None
     enabled: Optional[bool] = None
     timezone: Optional[str] = None
+    max_runs_per_week: Optional[int] = None
+    max_cost_per_run: Optional[float] = None
+
+
+def _check_budgets(max_runs_per_week: Optional[int], max_cost_per_run: Optional[float]) -> None:
+    if max_runs_per_week is not None and max_runs_per_week < 0:
+        raise HTTPException(status_code=400, detail="max_runs_per_week must be >= 0")
+    if max_cost_per_run is not None and max_cost_per_run < 0:
+        raise HTTPException(status_code=400, detail="max_cost_per_run must be >= 0")
 
 
 def _check_cron(expr: str, timezone: str = "") -> None:
@@ -929,9 +949,11 @@ async def list_jobs():
 async def create_job(job: JobCreate):
     _check_timezone(job.timezone)
     _check_cron(job.cron_expr, job.timezone)
+    _check_budgets(job.max_runs_per_week, job.max_cost_per_run)
     created = get_agent().scheduler_service.add_job(
         name=job.name, prompt=job.prompt, cron_expr=job.cron_expr,
         description=job.description, enabled=job.enabled, timezone=job.timezone,
+        max_runs_per_week=job.max_runs_per_week, max_cost_per_run=job.max_cost_per_run,
     )
     return {"success": True, "job": created.to_dict()}
 
@@ -958,7 +980,16 @@ async def update_job(job_id: str, update: JobUpdate):
         _check_timezone(fields["timezone"])
     if "cron_expr" in fields:
         _check_cron(fields["cron_expr"], fields.get("timezone", ""))
+    _check_budgets(fields.get("max_runs_per_week"), fields.get("max_cost_per_run"))
     job = agent.scheduler_service.update_job(job_id, **fields) if fields else agent.scheduler_store.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {"success": True, "job": job.to_dict()}
+
+
+@app.post("/jobs/{job_id}/resume")
+async def resume_job(job_id: str):
+    job = get_agent().scheduler_service.resume_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     return {"success": True, "job": job.to_dict()}
@@ -990,6 +1021,24 @@ async def dry_run_job(job_id: str):
 async def list_job_runs(job_id: str, limit: int = Query(20, ge=1, le=200)):
     runs = get_agent().scheduler_store.list_runs(job_id=job_id, limit=limit)
     return {"runs": [r.to_dict() for r in runs], "count": len(runs)}
+
+
+# ─── Away mode ────────────────────────────────────────────────────────
+
+class AwayUpdate(BaseModel):
+    enabled: bool = False
+
+
+@app.get("/away")
+async def get_away():
+    return get_agent().away_state.status()
+
+
+@app.post("/away")
+async def set_away(update: AwayUpdate):
+    agent = get_agent()
+    agent.away_state.set_manual(update.enabled)
+    return agent.away_state.status()
 
 
 # ─── Images ───────────────────────────────────────────────────────────
