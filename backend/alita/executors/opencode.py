@@ -18,17 +18,16 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 from .base import ExecutorEvent
-
-if TYPE_CHECKING:  # pragma: no cover - imported for type checkers only
-    from .mandate import Mandate
+from .mandate import Mandate
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +57,7 @@ class _Run:
     queue: "asyncio.Queue[Optional[ExecutorEvent]]" = field(default_factory=asyncio.Queue)
     session_ready: asyncio.Event = field(default_factory=asyncio.Event)
     workdir: Optional[Path] = None
+    mandate: Optional[Mandate] = None
     initial_pending: bool = True
     interrupted: bool = False
     timed_out: bool = False
@@ -127,6 +127,49 @@ class OpenCodeExecutor:
 
     # ── public protocol ──────────────────────────────────────────────
 
+    @staticmethod
+    def _coerce_mandate(mandate: "Mandate | None", workdir: Path) -> Mandate:
+        if mandate is None:
+            resolved = Mandate.read_only()
+        elif isinstance(mandate, Mandate):
+            resolved = mandate
+        else:
+            resolved = Mandate.from_dict(mandate)
+        resolved.validate()
+        resolved.validate_globs(workdir)
+        return resolved
+
+    def _prepare_config(self, workdir: Path, mandate: Mandate, handle: str) -> Path:
+        """Write Alita's own per-run OpenCode config and return its path.
+
+        A hand-written ``opencode.json`` in the workdir is never inherited or
+        overwritten: the delegation fails loudly instead.  Each run gets its
+        own file so two sessions in the same workdir cannot share (and thereby
+        escalate) each other's permissions.
+        """
+        workdir = Path(workdir).resolve()
+        for name in ("opencode.json", "opencode.jsonc"):
+            conflict = workdir / name
+            if conflict.exists():
+                raise RuntimeError(
+                    f"refusing to delegate: workdir already contains {conflict}; "
+                    "move it away or choose another workdir. Alita will not "
+                    "inherit or overwrite a hand-written OpenCode config."
+                )
+
+        config_dir = workdir / ".alita"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        safe_handle = re.sub(r"[^A-Za-z0-9_.-]", "_", str(handle or "run"))
+        config_path = config_dir / f"opencode-{safe_handle}.json"
+        payload = {
+            "$schema": "https://opencode.ai/config.json",
+            "permission": mandate.to_opencode_permissions(workdir),
+        }
+        config_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        return config_path
+
     async def start(
         self,
         task: str,
@@ -135,11 +178,10 @@ class OpenCodeExecutor:
         workdir: Path | None = None,
     ) -> str:
         """Spawn OpenCode on ``task`` and return its session handle."""
-        if mandate is not None:
-            logger.debug("OpenCodeExecutor ignores mandate for now")
-
-        provisional = f"oc-{uuid.uuid4().hex[:12]}"
-        run = _Run(handle=provisional, workdir=Path(workdir) if workdir is not None else None)
+        work = Path(workdir) if workdir is not None else Path.cwd()
+        resolved = self._coerce_mandate(mandate, work)
+        run = _Run(handle=f"oc-{uuid.uuid4().hex[:12]}", workdir=work, mandate=resolved)
+        provisional = run.handle
         self._runs[provisional] = run
         try:
             await self._spawn(run, task, session_id=None, workdir=run.workdir, queue=run.queue)
@@ -169,32 +211,53 @@ class OpenCodeExecutor:
         workdir: Path | str | None = None,
         session_id: str | None = None,
         cost: float = 0.0,
+        mandate: "Mandate | None" = None,
     ) -> _Run:
         """Rebuild an in-memory run from a persisted handle (after a restart).
 
         ``session_id`` defaults to ``handle`` because OpenCode session ids are
         themselves the handle. The caller is responsible for validating
-        ``workdir`` before passing it here.
+        ``workdir`` before passing it here. ``mandate`` must be the persisted
+        envelope; a missing mandate falls back to read-only.
         """
         sid = str(session_id or handle)
+        work = Path(workdir) if workdir is not None else None
+        resolved = self._coerce_mandate(
+            mandate, work if work is not None else Path.cwd()
+        )
         run = self._runs.get(handle) or self._runs.get(sid)
         if run is None:
             run = _Run(
                 handle=handle,
                 session_id=sid,
-                workdir=Path(workdir) if workdir is not None else None,
+                workdir=work,
+                mandate=resolved,
             )
             self._runs[handle] = run
         else:
             run.session_id = sid
-            if workdir is not None:
-                run.workdir = Path(workdir)
+            if work is not None:
+                run.workdir = work
+            run.mandate = resolved
         run.initial_pending = False
         run.cost = float(cost or 0.0)
         run.session_ready.set()
         self._runs.setdefault(handle, run)
         self._runs.setdefault(sid, run)
         return run
+
+    def set_mandate(self, handle: str, mandate: Mandate) -> None:
+        """Apply an already-intersected mandate before resuming a run."""
+        run = self._runs.get(handle)
+        if run is None:
+            raise KeyError(f"unknown opencode handle: {handle}")
+        work = run.workdir if run.workdir is not None else Path.cwd()
+        resolved = self._coerce_mandate(mandate, work)
+        run.mandate = resolved
+
+    def handle_mandate(self, handle: str) -> Optional[Mandate]:
+        run = self._runs.get(handle)
+        return run.mandate if run is not None else None
 
     def _persist(self, run: _Run) -> None:
         """Best-effort save of the resume record for ``run``."""
@@ -209,6 +272,7 @@ class OpenCodeExecutor:
                 self.name,
                 str(run.workdir) if run.workdir is not None else "",
                 cost=run.cost,
+                mandate=run.mandate.to_dict() if run.mandate is not None else None,
             )
         except Exception:  # noqa: BLE001
             logger.warning(
@@ -307,7 +371,18 @@ class OpenCodeExecutor:
         workdir: Path | None,
         queue: "asyncio.Queue[Optional[ExecutorEvent]]",
     ) -> None:
-        argv = self._argv(workdir=workdir, session_id=session_id, prompt=prompt)
+        work = Path(workdir) if workdir is not None else Path.cwd()
+        mandate = run.mandate or Mandate.read_only()
+        run.mandate = mandate
+        config_path = self._prepare_config(work, mandate, run.handle)
+        env = os.environ.copy()
+        env["OPENCODE_CONFIG"] = str(config_path)
+        # Prevents discovery of project configs upward from the workdir.  The
+        # explicit OPENCODE_CONFIG above is merged after the global config and
+        # is the only project-local policy Alita wants.
+        env["OPENCODE_DISABLE_PROJECT_CONFIG"] = "1"
+
+        argv = self._argv(workdir=work, session_id=session_id, prompt=prompt)
         logger.debug("Starting opencode: %s", argv)
 
         run.process = None
@@ -322,7 +397,8 @@ class OpenCodeExecutor:
                 *argv,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=str(workdir) if workdir is not None else None,
+                cwd=str(work),
+                env=env,
             )
         except Exception as exc:  # noqa: BLE001
             run.returncode = -1

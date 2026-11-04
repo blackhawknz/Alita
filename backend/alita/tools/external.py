@@ -20,14 +20,17 @@ guardrail trips).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ..core import config
 from ..core.away import AwayState
 from ..executors.base import Executor
+from ..executors.mandate import Mandate
 from ..executors.report import Report
 from .registry import Tool
 
@@ -56,6 +59,85 @@ def _within(path: Path, root: Path) -> bool:
         return os.path.commonpath([_norm(path), _norm(root)]) == _norm(root)
     except ValueError:  # different drives on Windows
         return False
+
+
+_MANDATE_TOOL_KEYS = {
+    "read_only",
+    "allow_bash",
+    "allow_webfetch",
+    "write",
+    "note",
+}
+
+
+def _coerce_mandate(value: Any, workdir: Optional[Path]) -> Mandate:
+    """Turn a tool/persistence value into a validated ``Mandate``.
+
+    ``None`` fails closed to :meth:`Mandate.read_only`.  Unknown keys are
+    rejected so a typo cannot silently drop a restriction.
+    """
+    if value is None:
+        mandate = Mandate.read_only()
+    elif isinstance(value, Mandate):
+        mandate = value
+    elif isinstance(value, Mapping):
+        unknown = set(value) - _MANDATE_TOOL_KEYS
+        if unknown:
+            raise ValueError(
+                "unknown mandate key(s): "
+                + ", ".join(sorted(str(key) for key in unknown))
+            )
+        read_only = value.get("read_only", True)
+        if not isinstance(read_only, bool):
+            raise ValueError("mandate.read_only must be a boolean")
+        allow_bash = value.get("allow_bash", False)
+        allow_webfetch = value.get("allow_webfetch", False)
+        if not isinstance(allow_bash, bool) or not isinstance(allow_webfetch, bool):
+            raise ValueError("mandate.allow_bash/allow_webfetch must be booleans")
+        write = value.get("write") or []
+        if isinstance(write, str) or not isinstance(write, (list, tuple)):
+            raise ValueError("mandate.write must be a list of glob strings")
+        note = str(value.get("note") or "")
+        if read_only:
+            if write or allow_bash or allow_webfetch:
+                raise ValueError(
+                    "read_only=True cannot be combined with write, allow_bash "
+                    "or allow_webfetch; set read_only=false explicitly"
+                )
+            mandate = Mandate.read_only(note=note)
+        else:
+            mandate = Mandate.from_dict(
+                {
+                    "read": ["*"],
+                    "write": list(write),
+                    "allow_bash": allow_bash,
+                    "allow_webfetch": allow_webfetch,
+                    "allow_subagents": False,
+                    "source": "user",
+                    "note": note,
+                }
+            )
+    else:
+        raise ValueError("mandate must be an object, not free text")
+
+    mandate.validate()
+    if workdir is not None:
+        mandate.validate_globs(workdir)
+    return mandate
+
+
+def _mandate_from_record(record: Optional[Dict[str, Any]]) -> Optional[Mandate]:
+    if not record:
+        return None
+    raw = record.get("mandate_json")
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        return Mandate.from_dict(data)
+    except (ValueError, TypeError, json.JSONDecodeError):
+        logger.warning("Ignoring invalid stored mandate for %s", record.get("handle"))
+        return None
 
 
 def parse_allowed_roots(raw: Optional[str]) -> List[Path]:
@@ -239,63 +321,138 @@ class ExternalToolManager:
 
     def _find_handle(
         self, handle: str
-    ) -> Tuple[Optional[str], Optional[Executor], Optional[str]]:
+    ) -> Tuple[
+        Optional[str],
+        Optional[Executor],
+        Optional[str],
+        Optional[Mandate],
+        Optional[Path],
+    ]:
         """Locate a live handle or rehydrate one persisted before a restart.
 
-        Returns ``(name, executor, error)``. ``error`` is only set when a
-        stored record exists but cannot safely be resumed (for example a
-        workdir outside the allowed roots).
+        Returns ``(name, executor, error, mandate, workdir)``.  ``error`` is
+        only set when a stored record exists but cannot safely be resumed (for
+        example a workdir outside the allowed roots).  ``mandate`` is the
+        stored/enforced envelope and is never widened here.
         """
+        stored_record: Optional[Dict[str, Any]] = None
+        if self.sqlite is not None:
+            try:
+                stored_record = self.sqlite.load_external_handle(handle)
+            except Exception:  # noqa: BLE001
+                logger.warning("Could not load external handle %s", handle, exc_info=True)
+
         for name, executor in list(self._registry().items()):
             check = getattr(executor, "has_handle", None)
             if callable(check):
                 try:
                     if check(handle):
-                        return name, executor, None
+                        mandate = _mandate_from_record(stored_record)
+                        if mandate is None:
+                            get_mandate = getattr(executor, "handle_mandate", None)
+                            if callable(get_mandate):
+                                try:
+                                    candidate = get_mandate(handle)
+                                    if isinstance(candidate, Mandate):
+                                        mandate = candidate
+                                except Exception:  # noqa: BLE001
+                                    logger.debug(
+                                        "handle_mandate failed for %s", name, exc_info=True
+                                    )
+                        workdir: Optional[Path] = None
+                        if stored_record and stored_record.get("workdir"):
+                            try:
+                                workdir = resolve_workdir(
+                                    stored_record.get("workdir"),
+                                    workspace=self.workspace,
+                                    allowed_roots_raw=self._allowed_roots_raw(),
+                                )
+                            except WorkdirError:
+                                workdir = None
+                        if mandate is not None and workdir is not None:
+                            try:
+                                mandate.validate()
+                                mandate.validate_globs(workdir)
+                            except ValueError as exc:
+                                logger.warning(
+                                    "Refusing to resume handle %s: %s", handle, exc
+                                )
+                                return (
+                                    None,
+                                    None,
+                                    f"stored mandate is not safe to resume: {exc}",
+                                    None,
+                                    workdir,
+                                )
+                        return name, executor, None, mandate, workdir
                 except Exception:  # noqa: BLE001
                     logger.debug("has_handle failed for %s", name, exc_info=True)
 
-        if self.sqlite is None:
-            return None, None, None
-        try:
-            record = self.sqlite.load_external_handle(handle)
-        except Exception:  # noqa: BLE001
-            logger.warning("Could not load external handle %s", handle, exc_info=True)
-            return None, None, None
-        if not record:
-            return None, None, None
+        if stored_record is None:
+            return None, None, None, None, None
 
-        name = str(record.get("executor") or "").strip()
+        name = str(stored_record.get("executor") or "").strip()
         try:
             executor = self._get_executor(name)
         except ExternalToolError as exc:
-            return None, None, str(exc)
+            return None, None, str(exc), None, None
 
         try:
             resolved = resolve_workdir(
-                record.get("workdir") or None,
+                stored_record.get("workdir") or None,
                 workspace=self.workspace,
                 allowed_roots_raw=self._allowed_roots_raw(),
             )
         except WorkdirError as exc:
             logger.warning("Refusing to resume stored handle %s: %s", handle, exc)
-            return None, None, str(exc)
+            return None, None, str(exc), None, None
+
+        mandate = _mandate_from_record(stored_record) or Mandate.read_only()
+        try:
+            mandate.validate()
+            mandate.validate_globs(resolved)
+        except ValueError as exc:
+            logger.warning("Refusing to resume handle %s: %s", handle, exc)
+            return None, None, f"stored mandate is not safe to resume: {exc}", None, resolved
 
         rehydrate = getattr(executor, "rehydrate", None)
         if not callable(rehydrate):
-            return None, None, None
+            return None, None, None, mandate, resolved
 
         try:
             rehydrate(
                 handle,
                 workdir=resolved,
                 session_id=handle,
-                cost=_float(record.get("cost", 0.0), 0.0),
+                cost=_float(stored_record.get("cost", 0.0), 0.0),
+                mandate=mandate,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not rehydrate external handle %s", handle, exc_info=True)
-            return None, None, f"could not resume {handle!r}: {exc}"
-        return name, executor, None
+            return None, None, f"could not resume {handle!r}: {exc}", None, resolved
+        return name, executor, None, mandate, resolved
+
+    def _save_handle_mandate(
+        self, handle: str, name: str, workdir: Optional[Path], mandate: Mandate
+    ) -> None:
+        if self.sqlite is None:
+            return
+        if workdir is None:
+            try:
+                if self.sqlite.load_external_handle(handle) is None:
+                    return
+            except Exception:  # noqa: BLE001
+                return
+        try:
+            self.sqlite.save_external_handle(
+                handle,
+                name,
+                str(workdir) if workdir is not None else "",
+                mandate=mandate.to_dict(),
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("Could not persist mandate for %s", handle, exc_info=True)
+
 
     # ── spend tracking ──────────────────────────────────────────────
 
@@ -347,6 +504,11 @@ class ExternalToolManager:
             return _failure(name, str(exc))
 
         try:
+            mandate_obj = _coerce_mandate(mandate, resolved)
+        except ValueError as exc:
+            return _failure(name, str(exc))
+
+        try:
             ex = self._get_executor(name)
         except ExternalToolError as exc:
             return _failure(name, str(exc))
@@ -360,14 +522,13 @@ class ExternalToolManager:
                 f"ALITA_EXECUTOR_DAILY_COST=${daily_cap:g}",
             )
 
-        if mandate is not None:
-            logger.debug("External mandate is accepted but not enforced until D5")
-
         try:
-            handle = await ex.start(task, workdir=resolved)
+            handle = await ex.start(task, mandate=mandate_obj, workdir=resolved)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to start external executor %s: %s", name, exc)
             return _failure(name, f"failed to start {name}: {exc}")
+
+        self._save_handle_mandate(handle, name, resolved, mandate_obj)
 
         iterator = ex.send(handle, "")
         return await self._collect(
@@ -385,9 +546,14 @@ class ExternalToolManager:
         session_id: str,
         message: str,
         *,
+        mandate: Any = None,
         max_minutes: Any = 30,
     ) -> Dict[str, Any]:
-        """Resume an existing external session with a new message."""
+        """Resume an existing external session with a new message.
+
+        The stored mandate is the ceiling: a caller may narrow it but a wider
+        request is intersected back down instead of escalating the session.
+        """
         handle = str(session_id or "").strip()
         message = str(message or "")
         if not handle:
@@ -398,7 +564,7 @@ class ExternalToolManager:
         if away_error:
             return _failure("", away_error, session_id=handle)
 
-        name, ex, resume_error = self._find_handle(handle)
+        name, ex, resume_error, stored_mandate, stored_workdir = self._find_handle(handle)
         if ex is None or name is None:
             return _failure(
                 "",
@@ -409,6 +575,28 @@ class ExternalToolManager:
                 ),
                 session_id=handle,
             )
+
+        original = stored_mandate or Mandate.read_only()
+        try:
+            original.validate()
+            if mandate is None:
+                effective = original
+            else:
+                requested = _coerce_mandate(mandate, stored_workdir)
+                effective = original.intersect(requested)
+            effective.validate()
+        except ValueError as exc:
+            return _failure(name, str(exc), session_id=handle)
+
+        set_mandate = getattr(ex, "set_mandate", None)
+        if callable(set_mandate):
+            try:
+                set_mandate(handle, effective)
+            except Exception as exc:  # noqa: BLE001
+                return _failure(
+                    name, f"could not apply mandate to {handle!r}: {exc}", session_id=handle
+                )
+        self._save_handle_mandate(handle, name, stored_workdir, effective)
 
         daily_cap = _float(getattr(self.settings, "executor_daily_cost", 0.0), 0.0)
         spent = self._spent(name)
@@ -564,14 +752,53 @@ def _failure(
 
 # ─── Tools ──────────────────────────────────────────────────────────
 
+MANDATE_TOOL_SCHEMA = {
+    "type": "object",
+    "description": (
+        "Permission envelope for the external worker. Defaults to read-only. "
+        "`bash` is a full-write capability: allow_bash=true is only accepted "
+        "with write=['*'] because a shell can write anywhere the OS user can."
+    ),
+    "properties": {
+        "read_only": {
+            "type": "boolean",
+            "default": True,
+            "description": "When true (default) the worker may only read the workdir.",
+        },
+        "allow_bash": {
+            "type": "boolean",
+            "default": False,
+            "description": "Allow shell commands. Requires write=['*'].",
+        },
+        "allow_webfetch": {
+            "type": "boolean",
+            "default": False,
+            "description": "Allow fetching URLs from the web.",
+        },
+        "write": {
+            "type": "array",
+            "items": {"type": "string"},
+            "default": [],
+            "description": "Write globs relative to the workdir; empty means no writes.",
+        },
+        "note": {
+            "type": "string",
+            "description": "Human-readable note. NOT enforced; permission comes from the fields above.",
+        },
+    },
+    "additionalProperties": False,
+}
+
+
 DELEGATE_EXTERNAL_TOOL_SCHEMA = {
     "name": "delegate_external",
     "description": (
         "Hand a coding task to an external CLI agent (OpenCode by default). This "
         "spends real money and runs outside Alita's tools, so it is capped per "
         "call and per day. `workdir` must stay inside the workspace (or an "
-        "allowed root). The returned `session_id` can be resumed with "
-        "`answer_external`."
+        "allowed root). `mandate` is an enforced permission envelope and "
+        "defaults to read-only. The returned `session_id` can be resumed with "
+        "`answer_external`; a resumed session keeps its original mandate."
     ),
     "parameters": {
         "type": "object",
@@ -587,10 +814,7 @@ DELEGATE_EXTERNAL_TOOL_SCHEMA = {
                 "type": "string",
                 "description": "Working directory, inside the workspace or an allowed root.",
             },
-            "mandate": {
-                "type": "string",
-                "description": "Optional scope note passed to the external agent.",
-            },
+            "mandate": MANDATE_TOOL_SCHEMA,
             "max_minutes": {
                 "type": "number",
                 "description": "Wall-clock limit in minutes (default 30).",
@@ -606,13 +830,16 @@ ANSWER_EXTERNAL_TOOL_SCHEMA = {
     "name": "answer_external",
     "description": (
         "Resume an external agent session started by `delegate_external`, "
-        "sending it a follow-up message. The same cost caps apply."
+        "sending it a follow-up message. The same cost caps apply. An optional "
+        "`mandate` may narrow the session's original permissions but can never "
+        "widen them."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "session_id": {"type": "string", "description": "The external session to resume."},
             "message": {"type": "string", "description": "The follow-up message or answer."},
+            "mandate": MANDATE_TOOL_SCHEMA,
         },
         "required": ["session_id", "message"],
     },
@@ -644,6 +871,7 @@ def make_answer_external_tool(manager: ExternalToolManager) -> Tool:
         return await manager.answer(
             str(kwargs.get("session_id") or ""),
             str(kwargs.get("message") or ""),
+            mandate=kwargs.get("mandate"),
         )
 
     return Tool(

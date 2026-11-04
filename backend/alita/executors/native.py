@@ -15,13 +15,11 @@ import logging
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Dict, Optional
+from typing import Any, AsyncIterator, Callable, Dict, Optional
 
 from .base import ExecutorEvent
+from .mandate import Mandate
 from ..tools.subagent import SubAgentManager, SubAgentResult
-
-if TYPE_CHECKING:  # pragma: no cover - imported for type checkers only
-    from .mandate import Mandate
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +52,25 @@ class NativeExecutor:
         mandate: "Mandate | None" = None,
         workdir: Path | None = None,
     ) -> str:
-        """Schedule ``task`` on the sub-agent manager and return its handle."""
+        """Schedule ``task`` on the sub-agent manager and return its handle.
+
+        The native sub-agent runtime does not yet expose per-tool gates, so a
+        mandate it cannot enforce is rejected instead of silently ignored.
+        Read-only mandates and no mandate (which defaults to read-only) work.
+        """
+        if mandate is None:
+            resolved = Mandate.read_only()
+        elif isinstance(mandate, Mandate):
+            resolved = mandate
+        else:
+            resolved = Mandate.from_dict(mandate)
+        resolved.validate()
+        if not resolved.is_read_only():
+            raise NotImplementedError(
+                "NativeExecutor cannot enforce a non-read-only mandate; use an "
+                "external executor for write/bash/webfetch capabilities"
+            )
+
         handle = f"native-{uuid.uuid4().hex[:12]}"
         run = _NativeRun(task=None)
         self._runs[handle] = run
@@ -70,8 +86,6 @@ class NativeExecutor:
         )
         if workdir is not None:
             logger.debug("NativeExecutor ignores workdir=%s (runs in the workspace)", workdir)
-        if mandate is not None:
-            logger.debug("NativeExecutor ignores mandate for handle %s", handle)
         return handle
 
     async def _run(
