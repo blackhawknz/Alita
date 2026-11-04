@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import datetime, tzinfo
+from datetime import datetime, timedelta, tzinfo
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -30,7 +30,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.jobstores.memory import MemoryJobStore
 
-from ..core import config
+from ..core import config, pricing
 from .store import SchedulerStore, ScheduledJob
 
 try:  # APScheduler already depends on tzlocal; keep a stdlib fallback.
@@ -123,9 +123,13 @@ class SchedulerService:
         CronTrigger.from_crontab(cron_expr, timezone=SchedulerService.resolve_timezone(timezone))
 
     def add_job(self, name: str, prompt: str, cron_expr: str,
-                description: str = "", enabled: bool = True, timezone: str = "") -> ScheduledJob:
+                description: str = "", enabled: bool = True, timezone: str = "",
+                max_runs_per_week: int = 0, max_cost_per_run: float = 0.0) -> ScheduledJob:
         """Create a new scheduled job and register it with APScheduler."""
-        job = self.store.create_job(name, prompt, cron_expr, description, enabled, timezone)
+        job = self.store.create_job(
+            name, prompt, cron_expr, description, enabled, timezone,
+            max_runs_per_week=max_runs_per_week, max_cost_per_run=max_cost_per_run,
+        )
         if enabled:
             self._register_aps_job(job)
         return job
@@ -140,6 +144,16 @@ class SchedulerService:
         if updated.enabled:
             self._register_aps_job(updated)
         return updated
+
+    def resume_job(self, job_id: str) -> Optional[ScheduledJob]:
+        """Clear a budget pause and register the job again."""
+        job = self.store.resume_job(job_id)
+        if job is None:
+            return None
+        self._unregister_aps_job(job_id)
+        if job.enabled:
+            self._register_aps_job(job)
+        return job
 
     def remove_job(self, job_id: str) -> bool:
         """Delete a job and unregister it from APScheduler."""
@@ -243,6 +257,9 @@ class SchedulerService:
     def _register_aps_job(self, job: ScheduledJob) -> None:
         if self._scheduler is None or not self._started:
             return
+        if job.paused_reason:
+            logger.info("Skipping registration of paused job %s: %s", job.id, job.paused_reason)
+            return
         try:
             trigger = CronTrigger.from_crontab(job.cron_expr, timezone=self.resolve_timezone(job.timezone))
         except ValueError as exc:
@@ -285,11 +302,51 @@ class SchedulerService:
             pass
         return ""
 
+    def _pause_job(self, job: ScheduledJob, reason: str) -> bool:
+        """Pause once, log once, and stop future APScheduler firings."""
+        if not self.store.pause_job(job.id, reason):
+            return False
+        self._unregister_aps_job(job.id)
+        logger.warning("Paused scheduled job %s: %s", job.id, reason)
+        return True
+
+    def _record_skipped_run(self, job_id: str, prompt: str, reason: str) -> None:
+        run = self.store.create_run(job_id, prompt)
+        self.store.finish_run(run.id, "skipped", error=reason)
+
+    def _run_cost(self, job_id: str, started_at: str) -> float:
+        """Cost of the usage events recorded since this run started."""
+        if not started_at:
+            return 0.0
+        # job_runs.started_at uses an ISO "T"; usage_events.created_at uses a
+        # SQL space. Comparing mixed formats would exclude same-day rows.
+        since_sql = started_at.replace("T", " ")[:19]
+        try:
+            events = self.store.usage_events_for_job_since(job_id, since_sql)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not read usage for job %s: %s", job_id, exc)
+            return 0.0
+        return pricing.events_cost(events)
+
     async def _execute_job(self, job_id: str, prompt: str) -> None:
         """Run one job invocation in its own ``job`` session (never touches chat sessions)."""
         job = self.store.get_job(job_id)
         if job is not None:
             prompt = job.prompt  # always run the latest prompt
+            if job.paused_reason:
+                logger.info("Scheduled job %s is paused (%s); skipping", job_id, job.paused_reason)
+                return
+            if job.max_runs_per_week > 0:
+                cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
+                count = self.store.count_runs_since(job_id, cutoff)
+                if count >= job.max_runs_per_week:
+                    reason = (
+                        f"Weekly run budget reached "
+                        f"({count} of {job.max_runs_per_week})"
+                    )
+                    self._record_skipped_run(job_id, prompt, reason)
+                    self._pause_job(job, reason)
+                    return
         logger.info("Scheduled job %s executing: %s", job_id, prompt[:80])
         run = self.store.create_run(job_id, prompt)
         start_time = time.time()
@@ -319,10 +376,18 @@ class SchedulerService:
             if result.get("interrupted"):
                 error = error or "Execution interrupted"
             status = "failed" if (error and not response) else "completed"
-            self.store.finish_run(run.id, status, response, error, tool_calls, duration_ms)
+            cost = self._run_cost(job_id, run.started_at)
+            self.store.finish_run(run.id, status, response, error, tool_calls, duration_ms, cost=cost)
+            if job is not None and job.max_cost_per_run > 0 and cost > job.max_cost_per_run + 1e-9:
+                reason = (
+                    f"Run cost ${cost:.4f} exceeded budget "
+                    f"${job.max_cost_per_run:.4f}"
+                )
+                self._pause_job(job, reason)
         except Exception as exc:  # noqa: BLE001
             duration_ms = int((time.time() - start_time) * 1000)
-            self.store.finish_run(run.id, "failed", "", str(exc), [], duration_ms)
+            cost = self._run_cost(job_id, run.started_at)
+            self.store.finish_run(run.id, "failed", "", str(exc), [], duration_ms, cost=cost)
             logger.warning("Scheduled job %s failed: %s", job_id, exc)
         finally:
             self.store.mark_job_run(job_id, next_run_at=self._next_run_iso(job_id))

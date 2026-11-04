@@ -892,6 +892,8 @@ class JobCreate(BaseModel):
     cron_expr: str
     enabled: bool = True
     timezone: str = ""
+    max_runs_per_week: int = 0
+    max_cost_per_run: float = 0.0
 
 
 class JobUpdate(BaseModel):
@@ -901,6 +903,15 @@ class JobUpdate(BaseModel):
     cron_expr: Optional[str] = None
     enabled: Optional[bool] = None
     timezone: Optional[str] = None
+    max_runs_per_week: Optional[int] = None
+    max_cost_per_run: Optional[float] = None
+
+
+def _check_budgets(max_runs_per_week: Optional[int], max_cost_per_run: Optional[float]) -> None:
+    if max_runs_per_week is not None and max_runs_per_week < 0:
+        raise HTTPException(status_code=400, detail="max_runs_per_week must be >= 0")
+    if max_cost_per_run is not None and max_cost_per_run < 0:
+        raise HTTPException(status_code=400, detail="max_cost_per_run must be >= 0")
 
 
 def _check_cron(expr: str, timezone: str = "") -> None:
@@ -929,9 +940,11 @@ async def list_jobs():
 async def create_job(job: JobCreate):
     _check_timezone(job.timezone)
     _check_cron(job.cron_expr, job.timezone)
+    _check_budgets(job.max_runs_per_week, job.max_cost_per_run)
     created = get_agent().scheduler_service.add_job(
         name=job.name, prompt=job.prompt, cron_expr=job.cron_expr,
         description=job.description, enabled=job.enabled, timezone=job.timezone,
+        max_runs_per_week=job.max_runs_per_week, max_cost_per_run=job.max_cost_per_run,
     )
     return {"success": True, "job": created.to_dict()}
 
@@ -958,7 +971,16 @@ async def update_job(job_id: str, update: JobUpdate):
         _check_timezone(fields["timezone"])
     if "cron_expr" in fields:
         _check_cron(fields["cron_expr"], fields.get("timezone", ""))
+    _check_budgets(fields.get("max_runs_per_week"), fields.get("max_cost_per_run"))
     job = agent.scheduler_service.update_job(job_id, **fields) if fields else agent.scheduler_store.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {"success": True, "job": job.to_dict()}
+
+
+@app.post("/jobs/{job_id}/resume")
+async def resume_job(job_id: str):
+    job = get_agent().scheduler_service.resume_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     return {"success": True, "job": job.to_dict()}
