@@ -176,6 +176,17 @@ class SQLiteStore:
     def _iso_now() -> str:
         return datetime.now(timezone.utc).isoformat()
 
+    @staticmethod
+    def _serialize_mandate(mandate: Any) -> Optional[str]:
+        if mandate is None:
+            return None
+        if isinstance(mandate, str):
+            return mandate
+        try:
+            return json.dumps(mandate, sort_keys=True)
+        except (TypeError, ValueError):
+            raise ValueError("mandate must be JSON-serialisable")
+
     def save_external_handle(
         self,
         handle: str,
@@ -183,38 +194,43 @@ class SQLiteStore:
         workdir: str,
         *,
         cost: Optional[float] = None,
+        mandate: Any = None,
     ) -> None:
         """Insert or update the record needed to resume an external session.
 
         ``cost`` is the handle's cumulative spend; when omitted the stored
-        value is preserved.
+        value is preserved.  ``mandate`` is the JSON-serialisable permission
+        envelope; when omitted the stored envelope is preserved so that a
+        cost update can never silently widen or erase a mandate.
         """
         handle = str(handle or "").strip()
         if not handle:
             return
+        mandate_json = self._serialize_mandate(mandate)
         now = self._iso_now()
         with self.tx() as conn:
             exists = conn.execute(
                 "SELECT 1 FROM external_handles WHERE handle = ?", (handle,)
             ).fetchone()
             if exists:
-                if cost is None:
-                    conn.execute(
-                        "UPDATE external_handles SET executor = ?, workdir = ?, "
-                        "updated_at = ? WHERE handle = ?",
-                        (str(executor), str(workdir), now, handle),
-                    )
-                else:
-                    conn.execute(
-                        "UPDATE external_handles SET executor = ?, workdir = ?, "
-                        "updated_at = ?, cost = ? WHERE handle = ?",
-                        (str(executor), str(workdir), now, float(cost), handle),
-                    )
+                sets = ["executor = ?", "workdir = ?", "updated_at = ?"]
+                params: List[Any] = [str(executor), str(workdir), now]
+                if cost is not None:
+                    sets.append("cost = ?")
+                    params.append(float(cost))
+                if mandate_json is not None:
+                    sets.append("mandate_json = ?")
+                    params.append(mandate_json)
+                params.append(handle)
+                conn.execute(
+                    f"UPDATE external_handles SET {', '.join(sets)} WHERE handle = ?",
+                    tuple(params),
+                )
             else:
                 conn.execute(
                     "INSERT INTO external_handles "
-                    "(handle, executor, workdir, created_at, updated_at, cost) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    "(handle, executor, workdir, created_at, updated_at, cost, mandate_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
                         handle,
                         str(executor),
@@ -222,6 +238,7 @@ class SQLiteStore:
                         now,
                         now,
                         float(cost or 0.0),
+                        mandate_json or "",
                     ),
                 )
 
@@ -360,7 +377,8 @@ class SQLiteStore:
                     workdir TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    cost REAL NOT NULL DEFAULT 0
+                    cost REAL NOT NULL DEFAULT 0,
+                    mandate_json TEXT NOT NULL DEFAULT ''
                 );
                 CREATE INDEX IF NOT EXISTS idx_external_handles_executor
                     ON external_handles(executor, updated_at);
@@ -401,6 +419,12 @@ class SQLiteStore:
             ]:
                 if col not in mem_cols:
                     conn.execute(f"ALTER TABLE memories ADD COLUMN {col} {ddl}")
+            ext_cols = self._columns("external_handles")
+            if "mandate_json" not in ext_cols:
+                conn.execute(
+                    "ALTER TABLE external_handles ADD COLUMN "
+                    "mandate_json TEXT NOT NULL DEFAULT ''"
+                )
             conn.executescript(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_external_ref
