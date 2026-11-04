@@ -255,7 +255,7 @@ class ExternalToolManager:
             return _failure(
                 name,
                 f"daily cost cap reached for {name}: ${spent:.4f} of "
-                f"ALITA_EXECUTOR_DAILY_COST=${daily_cap:.2f}",
+                f"ALITA_EXECUTOR_DAILY_COST=${daily_cap:g}",
             )
 
         if mandate is not None:
@@ -308,7 +308,7 @@ class ExternalToolManager:
             return _failure(
                 name,
                 f"daily cost cap reached for {name}: ${spent:.4f} of "
-                f"ALITA_EXECUTOR_DAILY_COST=${daily_cap:.2f}",
+                f"ALITA_EXECUTOR_DAILY_COST=${daily_cap:g}",
                 session_id=handle,
             )
 
@@ -353,13 +353,13 @@ class ExternalToolManager:
                     if max_cost > 0 and projected > max_cost + _COST_EPSILON:
                         cap_error = (
                             f"cost cap exceeded for {name}: ${projected:.4f} > "
-                            f"ALITA_EXECUTOR_MAX_COST=${max_cost:.2f}"
+                            f"ALITA_EXECUTOR_MAX_COST=${max_cost:g}"
                         )
                     elif daily_cap > 0 and daily_spent + call_cost > daily_cap + _COST_EPSILON:
                         cap_error = (
                             f"daily cost cap exceeded for {name}: "
                             f"${daily_spent + call_cost:.4f} > "
-                            f"ALITA_EXECUTOR_DAILY_COST=${daily_cap:.2f}"
+                            f"ALITA_EXECUTOR_DAILY_COST=${daily_cap:g}"
                         )
                     if cap_error:
                         errors.append(cap_error)
