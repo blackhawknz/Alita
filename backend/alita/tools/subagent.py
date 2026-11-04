@@ -17,7 +17,7 @@ import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from ..core.runtime import current_session
 from .registry import Tool
@@ -76,6 +76,7 @@ class SubAgentManager:
         system_message: Optional[str] = None,
         kind: str = "subagent",
         title: str = "",
+        on_child: Optional[Callable[[Any], None]] = None,
     ) -> SubAgentResult:
         task_id = uuid.uuid4().hex[:8]
         cap = max_iterations if max_iterations and max_iterations > 0 else self.default_max_iterations
@@ -92,6 +93,11 @@ class SubAgentManager:
         except Exception as exc:  # noqa: BLE001
             return SubAgentResult(task_id, task, "", 0, 0, error=f"could not create sub-agent: {exc}")
         self._active[task_id] = child
+        if on_child is not None:
+            try:
+                on_child(child)
+            except Exception:  # noqa: BLE001
+                logger.debug("Sub-agent on_child callback failed", exc_info=True)
         instructions = SUBAGENT_INSTRUCTIONS + (f"\n\n{system_message}" if system_message else "")
         try:
             result = await self.parent.run_conversation(

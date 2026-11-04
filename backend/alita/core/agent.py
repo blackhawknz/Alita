@@ -170,6 +170,8 @@ class AlitaAgent:
         self._register_builtin_tools(easy_diffusion_url or os.getenv("EASY_DIFFUSION_URL", "http://localhost:9000"))
 
         from ..tools.subagent import SubAgentManager, make_subagent_tool
+        from ..executors.base import Executor
+        from ..executors.native import NativeExecutor
         from ..tools.kanban_tool import make_kanban_tool
         from ..kanban.store import KanbanStore
         from ..kanban.executor import KanbanExecutor
@@ -179,6 +181,7 @@ class AlitaAgent:
         from .slash_commands import build_slash_registry
 
         self.subagent_manager = SubAgentManager(self, default_max_iterations=self.settings.subagent_max_iterations)
+        self.executors: Dict[str, Executor] = {"native": NativeExecutor(self.subagent_manager)}
         self.tool_registry.register(make_subagent_tool(self.subagent_manager))
         self.kanban_store = KanbanStore(str(self.sqlite.db_path))
         self.kanban_executor = KanbanExecutor(self.kanban_store, self.subagent_manager)
@@ -201,6 +204,10 @@ class AlitaAgent:
         self.llm = create_provider(provider, model=model, api_key=api_key)
         self.llm_provider_name = provider
         self.llm_model_name = self.llm.model
+
+    def get_executor(self, name: str) -> Optional[Executor]:
+        """Return a registered executor by name, or ``None``."""
+        return self.executors.get(name)
 
     @property
     def context_window(self) -> int:
