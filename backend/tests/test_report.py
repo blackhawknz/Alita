@@ -76,3 +76,15 @@ def test_from_dict_tolerates_odd_shapes():
     assert report.summary == "42"
     assert report.evidence == ["7"]
     assert report.question is None
+
+def test_waiting_without_a_question_is_demoted_to_ready():
+    """A waiting report the parent cannot answer would stall the worker forever."""
+    report = Report.parse('```report\n{"kind": "waiting"}\n```')
+    assert report.kind == "ready"
+    assert report.question is None
+
+
+def test_waiting_with_a_blank_question_is_demoted_to_ready():
+    report = Report.from_dict({"kind": "waiting", "question": "   ", "summary": "stuck"})
+    assert report.kind == "ready"
+    assert report.summary == "stuck"

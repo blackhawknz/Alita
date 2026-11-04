@@ -1,4 +1,4 @@
-"""
+﻿"""
 Structured worker reports.
 
 Sub-agents return prose today. A :class:`Report` gives the parent a small,
@@ -80,6 +80,12 @@ class Report:
             question = str(question)
             if not question.strip():
                 question = None
+
+        # A "waiting" report with no question is unanswerable: the parent has
+        # nothing to respond to and the worker would stall forever. Demote it
+        # to "ready" and keep whatever summary we have.
+        if kind == "waiting" and not question:
+            kind = "ready"
 
         return cls(kind=kind, summary=summary, evidence=evidence, question=question)
 
