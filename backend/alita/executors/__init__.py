@@ -2,7 +2,7 @@
 
 from .base import Executor, ExecutorEvent
 
-__all__ = ["Executor", "ExecutorEvent", "NativeExecutor"]
+__all__ = ["Executor", "ExecutorEvent", "NativeExecutor", "OpenCodeExecutor"]
 
 
 def __getattr__(name: str):
@@ -12,4 +12,8 @@ def __getattr__(name: str):
         from .native import NativeExecutor
 
         return NativeExecutor
+    if name == "OpenCodeExecutor":
+        from .opencode import OpenCodeExecutor
+
+        return OpenCodeExecutor
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
