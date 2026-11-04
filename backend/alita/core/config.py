@@ -139,6 +139,12 @@ class AgentSettings:
         self.headless_approval = _env("ALITA_HEADLESS_APPROVAL", "deny").lower()
         self.tool_result_max_chars = env_int("ALITA_TOOL_RESULT_MAX_CHARS", 24000)
         self.background_timeout = env_int("ALITA_BACKGROUND_TIMEOUT", 120)
+        # External executors (OpenCode, Claude Code). Costs real money, so the
+        # caps are on by default and the permission bypass stays off.
+        self.executor_max_cost = env_float("ALITA_EXECUTOR_MAX_COST", 0.50)
+        self.executor_daily_cost = env_float("ALITA_EXECUTOR_DAILY_COST", 5.00)
+        self.executor_allow_skip_permissions = env_bool("ALITA_EXECUTOR_ALLOW_SKIP_PERMISSIONS", False)
+        self.executor_allowed_roots = _env("ALITA_EXECUTOR_ALLOWED_ROOTS", "")
 
 
 # ─── .env management ──────────────────────────────────────────────────

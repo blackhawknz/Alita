@@ -17,11 +17,14 @@ import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from ..core.runtime import current_session
 from ..executors.report import REPORT_KINDS, Report
 from .registry import Tool
+
+if TYPE_CHECKING:  # pragma: no cover - imported for type checkers only
+    from .external import ExternalToolManager
 
 logger = logging.getLogger(__name__)
 
@@ -232,17 +235,49 @@ DELEGATE_TOOL_SCHEMA = {
         "properties": {
             "task": {"type": "string", "description": "Complete, self-contained task description."},
             "max_iterations": {"type": "integer", "description": "Optional step cap (default 25)."},
+            "executor": {
+                "type": "string",
+                "enum": ["native", "opencode", "claude_code"],
+                "default": "native",
+                "description": (
+                    "Who runs the task. 'native' (default) is an Alita sub-agent; "
+                    "'opencode'/'claude_code' hand it to an external CLI and are "
+                    "subject to the external cost/workdir guardrails."
+                ),
+            },
+            "workdir": {
+                "type": "string",
+                "description": (
+                    "Optional working directory for an external executor; must be "
+                    "inside the workspace or an allowed root."
+                ),
+            },
         },
         "required": ["task"],
     },
 }
 
 
-def make_subagent_tool(manager: SubAgentManager) -> Tool:
+def make_subagent_tool(
+    manager: SubAgentManager,
+    external: "ExternalToolManager | None" = None,
+) -> Tool:
     async def _handler(**kwargs: Any) -> Dict[str, Any]:
         task = kwargs.get("task") or ""
         if not task:
             return {"success": False, "error": "task is required"}
+        executor_name = str(kwargs.get("executor") or "native").strip().lower()
+        if executor_name not in ("", "native"):
+            if external is None:
+                return {
+                    "success": False,
+                    "error": f"executor {executor_name!r} is not available in this runtime",
+                }
+            return await external.delegate(
+                task,
+                executor=executor_name,
+                workdir=kwargs.get("workdir"),
+            )
         cap = kwargs.get("max_iterations")
         try:
             cap_i = int(cap) if cap is not None else None
