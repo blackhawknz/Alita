@@ -386,6 +386,14 @@ class AlitaAgent:
             self.sqlite.prune_empty_sessions()
         except Exception as exc:  # noqa: BLE001
             logger.debug("prune failed: %s", exc)
+        try:
+            stale = self.sqlite.sweep_stale_external_runs(
+                float(getattr(self.settings, "stale_run_hours", 2.0) or 2.0)
+            )
+            if stale:
+                logger.info("Marked %d stale external run(s) as failed", stale)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("stale run sweep failed: %s", exc)
         self.sandbox_mgr.prefetch_docker_status()
         self.kanban_executor.start()
         self.scheduler_service.start()

@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import sys
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -65,6 +66,8 @@ class _Run:
     stderr_tail: str = ""
     cost: float = 0.0
     tokens: Dict[str, Any] = field(default_factory=dict)
+    run_id: Optional[str] = None
+    started_monotonic: float = 0.0
 
 
 class OpenCodeExecutor:
@@ -279,6 +282,76 @@ class OpenCodeExecutor:
                 "Could not persist opencode handle %s", handle, exc_info=True
             )
 
+    # ── run telemetry (never allowed to break a paid run) ─────────────
+
+    def _telemetry(self, method: str, *args: Any, **kwargs: Any) -> None:
+        if self.store is None:
+            return
+        fn = getattr(self.store, method, None)
+        if not callable(fn):
+            return
+        try:
+            fn(*args, **kwargs)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "external run telemetry failed (%s)", method, exc_info=True
+            )
+
+    def _start_run(self, run: _Run, prompt: str, workdir: Path) -> None:
+        run.run_id = str(uuid.uuid4())
+        run.started_monotonic = time.monotonic()
+        self._telemetry(
+            "start_external_run",
+            run.run_id,
+            self.name,
+            str(workdir),
+            str(prompt or ""),
+            handle=run.session_id,
+        )
+
+    def _finish_run(
+        self,
+        run: _Run,
+        status: str,
+        *,
+        error: Optional[str],
+        text_parts: Optional[List[str]] = None,
+    ) -> None:
+        if not run.run_id:
+            return
+        duration_ms = None
+        if run.started_monotonic:
+            duration_ms = max(0, int((time.monotonic() - run.started_monotonic) * 1000))
+        summary = "".join(text_parts or []).strip()
+        self._telemetry(
+            "finish_external_run",
+            run.run_id,
+            status=status,
+            error=error,
+            result_summary=(summary[:300] or None),
+            duration_ms=duration_ms,
+        )
+
+    @staticmethod
+    def _tool_activity(part: Dict[str, Any]) -> str:
+        tool = str(part.get("tool") or part.get("name") or "tool").strip()
+        state = part.get("state")
+        args: Any = None
+        if isinstance(state, dict):
+            args = state.get("input")
+            if args is None:
+                args = state.get("args")
+        if args is None:
+            args = part.get("input")
+        if not isinstance(args, dict):
+            return tool
+        for key in ("command", "cmd", "filePath", "path", "pattern", "query"):
+            value = args.get(key)
+            if value:
+                text = re.sub(r"\s+", " ", str(value)).strip()
+                return f"{tool}: {text[:160]}"
+        return tool
+
     async def send(self, handle: str, message: str) -> AsyncIterator[ExecutorEvent]:
         """Stream the initial run, then resume the same session per call."""
         run = self._runs.get(handle)
@@ -391,6 +464,8 @@ class OpenCodeExecutor:
         run.interrupted = False
         run.timed_out = False
         run.queue = queue
+        run.run_id = None
+        run.started_monotonic = 0.0
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -407,6 +482,7 @@ class OpenCodeExecutor:
             raise RuntimeError(f"failed to start opencode: {exc}") from exc
 
         run.process = proc
+        self._start_run(run, prompt, work)
         run.reader_task = asyncio.create_task(
             self._read_stream(run, proc, queue),
             name=f"opencode-reader-{run.handle}",
@@ -498,6 +574,10 @@ class OpenCodeExecutor:
             run.handle = session_id
             run.session_ready.set()
             self._persist(run)
+            if run.run_id:
+                self._telemetry(
+                    "update_external_run", run.run_id, handle=session_id
+                )
 
         event_type = str(payload.get("type") or "").lower()
         part = payload.get("part")
@@ -538,6 +618,13 @@ class OpenCodeExecutor:
             return ExecutorEvent(kind="text", text=str(text or ""))
 
         if event_type in ("tool", "tool_use"):
+            if run.run_id:
+                self._telemetry(
+                    "record_external_run_activity",
+                    run.run_id,
+                    tool_calls=1,
+                    last_activity=self._tool_activity(part),
+                )
             return ExecutorEvent(kind="tool", data=part)
 
         if event_type == "step_finish":
@@ -553,6 +640,12 @@ class OpenCodeExecutor:
             run.cost += cost_value
             self._merge_tokens(run.tokens, tokens)
             self._persist(run)
+            if run.run_id and cost_value:
+                self._telemetry(
+                    "record_external_run_activity",
+                    run.run_id,
+                    cost=cost_value,
+                )
             return ExecutorEvent(
                 kind="done",
                 data={
@@ -595,67 +688,96 @@ class OpenCodeExecutor:
         saw_text = False
         saw_done = False
         saw_error = False
+        text_parts: List[str] = []
+        errors: List[str] = []
+        final_status: Optional[str] = None
+        final_error: Optional[str] = None
 
-        while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                timed_out = True
-                break
-            try:
-                item = await asyncio.wait_for(queue.get(), timeout=remaining)
-            except asyncio.TimeoutError:
-                timed_out = True
-                break
-            if item is None:
-                break
-            if item.kind == "text" and item.text and item.text.strip():
-                saw_text = True
-            elif item.kind == "done":
-                saw_done = True
-            elif item.kind == "error":
-                saw_error = True
-            yield item
+        try:
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    timed_out = True
+                    break
+                if item is None:
+                    break
+                if item.kind == "text" and item.text and item.text.strip():
+                    saw_text = True
+                    text_parts.append(item.text)
+                elif item.kind == "done":
+                    saw_done = True
+                elif item.kind == "error":
+                    saw_error = True
+                    if item.text:
+                        errors.append(item.text)
+                yield item
 
-        if timed_out:
-            run.timed_out = True
-            await self._stop(run)
-            yield ExecutorEvent(
-                kind="error",
-                text=f"timed out after {self.timeout:g}s",
-            )
-            yield ExecutorEvent(
-                kind="done",
-                data={
-                    "reason": "timeout",
-                    "tokens": dict(run.tokens),
-                    "cost": run.cost,
-                },
-                tokens=dict(run.tokens),
-            )
-            return
+            if timed_out:
+                run.timed_out = True
+                await self._stop(run)
+                message = f"timed out after {self.timeout:g}s"
+                errors.append(message)
+                yield ExecutorEvent(kind="error", text=message)
+                yield ExecutorEvent(
+                    kind="done",
+                    data={
+                        "reason": "timeout",
+                        "tokens": dict(run.tokens),
+                        "cost": run.cost,
+                    },
+                    tokens=dict(run.tokens),
+                )
+                final_status = "failed"
+                final_error = "; ".join(errors)
+                return
 
-        if run.returncode not in (0, None) and not run.interrupted:
-            tail = run.stderr_tail.strip()
-            if tail:
-                logger.warning("OpenCode stderr (handle %s): %s", run.handle, tail)
-            message = f"opencode exited with code {run.returncode}"
-            if tail:
-                message += f":\n{tail}"
-            yield ExecutorEvent(
-                kind="error",
-                text=message,
-                data={"returncode": run.returncode},
-            )
-            return
+            if run.returncode not in (0, None) and not run.interrupted:
+                tail = run.stderr_tail.strip()
+                if tail:
+                    logger.warning("OpenCode stderr (handle %s): %s", run.handle, tail)
+                message = f"opencode exited with code {run.returncode}"
+                if tail:
+                    message += f":\n{tail}"
+                errors.append(message)
+                yield ExecutorEvent(
+                    kind="error",
+                    text=message,
+                    data={"returncode": run.returncode},
+                )
+                final_status = "failed"
+                final_error = "; ".join(errors)
+                return
 
-        # OpenCode can exit 0 after an unreported provider failure. Treat a
-        # run that emitted no text and no done event as a failure rather than
-        # reporting an empty success to the caller.
-        if not saw_text and not saw_done and not saw_error and not run.interrupted:
-            yield ExecutorEvent(
-                kind="error",
-                text="opencode produced no output",
-                data={"returncode": run.returncode},
+            # OpenCode can exit 0 after an unreported provider failure. Treat a
+            # run that emitted no text and no done event as a failure rather than
+            # reporting an empty success to the caller.
+            if not saw_text and not saw_done and not saw_error and not run.interrupted:
+                message = "opencode produced no output"
+                errors.append(message)
+                yield ExecutorEvent(
+                    kind="error",
+                    text=message,
+                    data={"returncode": run.returncode},
+                )
+
+            if run.interrupted and not errors:
+                final_status = "cancelled"
+            elif errors:
+                final_status = "failed"
+                final_error = "; ".join(errors)
+            else:
+                final_status = "succeeded"
+        finally:
+            if final_status is None:
+                final_status = "cancelled" if run.interrupted else "failed"
+                final_error = final_error or "run ended without a result"
+            self._finish_run(
+                run, final_status, error=final_error, text_parts=text_parts
             )
 
     async def _stop(self, run: _Run) -> None:

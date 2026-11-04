@@ -143,6 +143,9 @@ class AgentSettings:
         # caps are on by default and the permission bypass stays off.
         self.executor_max_cost = env_float("ALITA_EXECUTOR_MAX_COST", 0.50)
         self.executor_daily_cost = env_float("ALITA_EXECUTOR_DAILY_COST", 5.00)
+        # A delegated run whose process disappeared is left "running" forever;
+        # the startup sweep fails it once it is this old.
+        self.stale_run_hours = env_float("ALITA_STALE_RUN_HOURS", 2.0)
         self.executor_allow_skip_permissions = env_bool("ALITA_EXECUTOR_ALLOW_SKIP_PERMISSIONS", False)
         self.executor_allowed_roots = _env("ALITA_EXECUTOR_ALLOWED_ROOTS", "")
         # OpenCode must always be given an explicit model: its own default may

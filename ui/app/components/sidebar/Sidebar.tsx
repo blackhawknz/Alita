@@ -2,6 +2,7 @@
 
 import type { RefObject } from 'react';
 import {
+  Activity,
   Brain,
   Clock,
   Image as ImageIcon,
@@ -27,6 +28,7 @@ const NAV: { id: View; label: string; icon: typeof Brain }[] = [
   { id: 'skills', label: 'Skills', icon: Sparkles },
   { id: 'board', label: 'Board', icon: Kanban },
   { id: 'jobs', label: 'Jobs', icon: Clock },
+  { id: 'activity', label: 'Activity', icon: Activity },
   { id: 'gallery', label: 'Gallery', icon: ImageIcon },
   { id: 'system', label: 'System', icon: Monitor },
   { id: 'settings', label: 'Settings', icon: Settings },
