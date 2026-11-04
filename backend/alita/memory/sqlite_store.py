@@ -19,6 +19,7 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 
@@ -139,6 +140,36 @@ class SQLiteStore:
             )
             return int(cur.lastrowid or 0)
 
+    # ─── External executor spending ──────────────────────────────
+
+    @staticmethod
+    def _spend_date(date: Optional[str] = None) -> str:
+        return date or datetime.now().date().isoformat()
+
+    def record_executor_spend(
+        self,
+        executor: str,
+        cost: float,
+        date: Optional[str] = None,
+    ) -> None:
+        """Add to an executor's spend for a day (UPSERT, safe at the cent)."""
+        if not cost:
+            return
+        with self.tx() as conn:
+            conn.execute(
+                "INSERT INTO executor_spend (date, executor, cost) VALUES (?, ?, ?) "
+                "ON CONFLICT(date, executor) DO UPDATE SET cost = cost + excluded.cost",
+                (self._spend_date(date), str(executor), float(cost)),
+            )
+
+    def get_executor_spend(self, executor: str, date: Optional[str] = None) -> float:
+        """Total recorded spend for an executor on a day (local date by default)."""
+        row = self.query_one(
+            "SELECT cost FROM executor_spend WHERE date = ? AND executor = ?",
+            (self._spend_date(date), str(executor)),
+        )
+        return float(row["cost"]) if row else 0.0
+
     def close(self) -> None:
         with self._lock:
             try:
@@ -225,6 +256,12 @@ class SQLiteStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_events(created_at);
                 CREATE INDEX IF NOT EXISTS idx_usage_session ON usage_events(session_id);
+                CREATE TABLE IF NOT EXISTS executor_spend (
+                    date TEXT NOT NULL,
+                    executor TEXT NOT NULL,
+                    cost REAL NOT NULL DEFAULT 0,
+                    PRIMARY KEY (date, executor)
+                );
                 """
             )
             # Columns added in schema v2 (idempotent for old databases).

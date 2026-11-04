@@ -169,7 +169,14 @@ class AlitaAgent:
         self.tool_registry = ToolRegistry()
         self._register_builtin_tools(easy_diffusion_url or os.getenv("EASY_DIFFUSION_URL", "http://localhost:9000"))
 
-        from ..tools.subagent import SubAgentManager, make_subagent_tool
+        from ..tools.subagent import SubAgentManager, make_answer_subagent_tool, make_subagent_tool
+        from ..tools.external import (
+            ExternalToolManager,
+            make_answer_external_tool,
+            make_delegate_external_tool,
+        )
+        from ..executors.base import Executor
+        from ..executors.native import NativeExecutor
         from ..tools.kanban_tool import make_kanban_tool
         from ..kanban.store import KanbanStore
         from ..kanban.executor import KanbanExecutor
@@ -179,7 +186,13 @@ class AlitaAgent:
         from .slash_commands import build_slash_registry
 
         self.subagent_manager = SubAgentManager(self, default_max_iterations=self.settings.subagent_max_iterations)
-        self.tool_registry.register(make_subagent_tool(self.subagent_manager))
+        self.executors: Dict[str, Executor] = {"native": NativeExecutor(self.subagent_manager)}
+        self._register_external_executors()
+        self.external_tools = ExternalToolManager(self)
+        self.tool_registry.register(make_subagent_tool(self.subagent_manager, self.external_tools))
+        self.tool_registry.register(make_answer_subagent_tool(self.subagent_manager))
+        self.tool_registry.register(make_delegate_external_tool(self.external_tools))
+        self.tool_registry.register(make_answer_external_tool(self.external_tools))
         self.kanban_store = KanbanStore(str(self.sqlite.db_path))
         self.kanban_executor = KanbanExecutor(self.kanban_store, self.subagent_manager)
         self.tool_registry.register(make_kanban_tool(self.kanban_store))
@@ -201,6 +214,24 @@ class AlitaAgent:
         self.llm = create_provider(provider, model=model, api_key=api_key)
         self.llm_provider_name = provider
         self.llm_model_name = self.llm.model
+
+    def _register_external_executors(self) -> None:
+        """Register CLI executors, tolerating a machine without them installed."""
+        try:
+            from ..executors.opencode import OpenCodeExecutor
+
+            extra_args: List[str] = []
+            if self.settings.executor_allow_skip_permissions:
+                extra_args.append("--dangerously-skip-permissions")
+            self.executors["opencode"] = OpenCodeExecutor(extra_args=extra_args)
+        except RuntimeError as exc:
+            logger.warning("OpenCode executor unavailable: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not register the OpenCode executor: %s", exc)
+
+    def get_executor(self, name: str) -> Optional[Executor]:
+        """Return a registered executor by name, or ``None``."""
+        return self.executors.get(name)
 
     @property
     def context_window(self) -> int:
@@ -322,7 +353,12 @@ class AlitaAgent:
     def tool_definitions(self, sess: Optional[Session] = None) -> List[Dict[str, Any]]:
         defs = self.tool_registry.list_definitions()
         if sess is not None and sess.depth >= self.settings.subagent_max_depth:
-            defs = [d for d in defs if d["function"]["name"] != "delegate_task"]
+            defs = [
+                d for d in defs
+                if d["function"]["name"] not in (
+                    "delegate_task", "answer_subagent", "delegate_external", "answer_external",
+                )
+            ]
         if sess is not None and sess.kind == "subagent":
             defs = [d for d in defs if d["function"]["name"] not in ("kanban", "skill_manage", "core_memory")]
         if sess is not None and sess.kind != "chat":
