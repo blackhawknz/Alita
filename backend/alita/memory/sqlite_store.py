@@ -170,6 +170,20 @@ class SQLiteStore:
         )
         return float(row["cost"]) if row else 0.0
 
+    # ─── Key/value application settings ──────────────────────────
+
+    def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        row = self.query_one("SELECT value FROM app_settings WHERE key = ?", (str(key),))
+        return row["value"] if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self.tx() as conn:
+            conn.execute(
+                "INSERT INTO app_settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(key), str(value)),
+            )
+
     def close(self) -> None:
         with self._lock:
             try:
@@ -261,6 +275,10 @@ class SQLiteStore:
                     executor TEXT NOT NULL,
                     cost REAL NOT NULL DEFAULT 0,
                     PRIMARY KEY (date, executor)
+                );
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL DEFAULT ''
                 );
                 """
             )

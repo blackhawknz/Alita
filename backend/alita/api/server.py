@@ -1023,6 +1023,24 @@ async def list_job_runs(job_id: str, limit: int = Query(20, ge=1, le=200)):
     return {"runs": [r.to_dict() for r in runs], "count": len(runs)}
 
 
+# ─── Away mode ────────────────────────────────────────────────────────
+
+class AwayUpdate(BaseModel):
+    enabled: bool = False
+
+
+@app.get("/away")
+async def get_away():
+    return get_agent().away_state.status()
+
+
+@app.post("/away")
+async def set_away(update: AwayUpdate):
+    agent = get_agent()
+    agent.away_state.set_manual(update.enabled)
+    return agent.away_state.status()
+
+
 # ─── Images ───────────────────────────────────────────────────────────
 
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}

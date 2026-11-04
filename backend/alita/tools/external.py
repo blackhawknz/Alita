@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ..core import config
+from ..core.away import AwayState
 from ..executors.base import Executor
 from ..executors.report import Report
 from .registry import Tool
@@ -187,6 +188,20 @@ class ExternalToolManager:
         raw = getattr(self.settings, "executor_allowed_roots", "") or ""
         return raw or os.getenv("ALITA_EXECUTOR_ALLOWED_ROOTS", "")
 
+    def _away(self) -> AwayState:
+        state = getattr(self.agent, "away_state", None) if self.agent is not None else None
+        if state is not None:
+            return state
+        return AwayState(self.sqlite, self.settings)
+
+    def _away_block(self) -> Optional[str]:
+        try:
+            if self._away().is_away() is True:
+                return "away mode is on; external delegation is paused"
+        except Exception:  # noqa: BLE001
+            logger.debug("away-mode check failed for external delegation", exc_info=True)
+        return None
+
     def _find_handle(self, handle: str) -> Tuple[Optional[str], Optional[Executor]]:
         for name, executor in self._registry().items():
             check = getattr(executor, "has_handle", None)
@@ -234,6 +249,9 @@ class ExternalToolManager:
         task = str(task or "").strip()
         if not task:
             return _failure(name, "task is required")
+        away_error = self._away_block()
+        if away_error:
+            return _failure(name, away_error)
 
         try:
             resolved = resolve_workdir(
@@ -292,6 +310,9 @@ class ExternalToolManager:
             return _failure("", "session_id is required")
         if not message:
             return _failure("", "message is required")
+        away_error = self._away_block()
+        if away_error:
+            return _failure("", away_error, session_id=handle)
 
         name, ex = self._find_handle(handle)
         if ex is None or name is None:

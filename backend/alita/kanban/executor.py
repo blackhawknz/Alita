@@ -62,9 +62,10 @@ class KanbanExecutor:
     """
 
     def __init__(self, store: KanbanStore, subagent_manager: Any,
-                 max_concurrent: Optional[int] = None):
+                 max_concurrent: Optional[int] = None, away_state: Any = None):
         self.store = store
         self.subagent_manager = subagent_manager
+        self.away_state = away_state
         self.max_concurrent = max(1, max_concurrent) if max_concurrent else _max_concurrent_from_env()
         self._task: Optional[asyncio.Task] = None
         self._in_flight: Set[str] = set()
@@ -125,6 +126,14 @@ class KanbanExecutor:
     def in_flight_count(self) -> int:
         return len(self._in_flight)
 
+    def _is_away(self) -> bool:
+        if self.away_state is None:
+            return False
+        try:
+            return self.away_state.is_away() is True
+        except Exception:  # noqa: BLE001
+            return False
+
     # ─── Poll loop ─────────────────────────────────────────────────
 
     async def _poll_loop(self) -> None:
@@ -139,6 +148,8 @@ class KanbanExecutor:
 
     async def _tick(self) -> None:
         """Dispatch executable cards up to the concurrency limit."""
+        if self._is_away():
+            return
         available = self.max_concurrent - len(self._in_flight)
         if available <= 0:
             return

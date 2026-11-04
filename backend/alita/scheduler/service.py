@@ -314,6 +314,17 @@ class SchedulerService:
         run = self.store.create_run(job_id, prompt)
         self.store.finish_run(run.id, "skipped", error=reason)
 
+    def _is_away(self) -> bool:
+        away = getattr(self.agent, "away_state", None)
+        if away is None:
+            return False
+        try:
+            # Require a real bool: a MagicMock test double would otherwise be
+            # truthy and put every scheduler test into away mode.
+            return away.is_away() is True
+        except Exception:  # noqa: BLE001
+            return False
+
     def _run_cost(self, job_id: str, started_at: str) -> float:
         """Cost of the usage events recorded since this run started."""
         if not started_at:
@@ -335,6 +346,10 @@ class SchedulerService:
             prompt = job.prompt  # always run the latest prompt
             if job.paused_reason:
                 logger.info("Scheduled job %s is paused (%s); skipping", job_id, job.paused_reason)
+                return
+            if self._is_away():
+                self._record_skipped_run(job_id, prompt, "away mode")
+                logger.info("Scheduled job %s skipped: away mode", job_id)
                 return
             if job.max_runs_per_week > 0:
                 cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
