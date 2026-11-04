@@ -6,7 +6,13 @@ from unittest.mock import AsyncMock
 import pytest
 
 from alita.core.runtime import current_session
-from alita.tools.subagent import DELEGATE_TOOL_SCHEMA, SubAgentManager, SubAgentResult, make_subagent_tool
+from alita.tools.subagent import (
+    DELEGATE_TOOL_SCHEMA,
+    SubAgentManager,
+    SubAgentResult,
+    make_answer_subagent_tool,
+    make_subagent_tool,
+)
 from tests.conftest import tool_call
 
 
@@ -107,3 +113,83 @@ async def test_tool_handler_validates():
     out = await tool.handler(task="do x", max_iterations="bad")
     assert out["response"] == "ok"
     mgr.delegate.assert_awaited_with("do x", max_iterations=None)
+
+
+async def test_delegate_attaches_a_structured_report(agent):
+    agent.llm.script = [{"content": '```report\n{"kind": "ready", "summary": "done"}\n```'}]
+    parent = agent.sessions.create(kind="chat")
+    token = current_session.set(parent)
+    try:
+        res = await agent.subagent_manager.delegate("finish the task")
+    finally:
+        current_session.reset(token)
+
+    assert res.report == {"kind": "ready", "summary": "done", "evidence": [], "question": None}
+    assert res.to_dict()["report"]["kind"] == "ready"
+
+
+async def test_waiting_report_can_be_resumed_after_forget(agent):
+    agent.llm.script = [
+        {"content": '```report\n{"kind": "waiting", "summary": "need a choice", '
+                    '"question": "A or B?"}\n```'},
+        {"content": '```report\n{"kind": "ready", "summary": "chose B"}\n```'},
+    ]
+    parent = agent.sessions.create(kind="chat")
+    token = current_session.set(parent)
+    try:
+        first = await agent.subagent_manager.delegate("choose a letter")
+        assert first.report["kind"] == "waiting"
+        assert first.report["question"] == "A or B?"
+        session_id = first.session_id
+        # delegate() forgets the child; resume must reload it from SQLite.
+        assert session_id not in agent.sessions._cache
+        assert agent.sessions.get(session_id) is not None
+
+        second = await agent.subagent_manager.resume(session_id, "B")
+    finally:
+        current_session.reset(token)
+
+    assert second.session_id == session_id
+    assert second.report["kind"] == "ready"
+    assert "chose B" in second.final_response
+
+
+async def test_answer_subagent_tool_resumes_the_session(agent):
+    agent.llm.script = [
+        {"content": '```report\n{"kind": "waiting", "summary": "need a choice", '
+                    '"question": "A or B?"}\n```'},
+        {"content": '```report\n{"kind": "ready", "summary": "chose B"}\n```'},
+    ]
+    parent = agent.sessions.create(kind="chat")
+    token = current_session.set(parent)
+    try:
+        first = await agent.subagent_manager.delegate("choose a letter")
+        tool = make_answer_subagent_tool(agent.subagent_manager)
+        out = await tool.handler(session_id=first.session_id, message="B")
+    finally:
+        current_session.reset(token)
+
+    assert out["success"] is True
+    assert out["session_id"] == first.session_id
+    assert out["report"]["kind"] == "ready"
+    assert "chose B" in out["response"]
+
+
+async def test_answer_subagent_tool_validates():
+    mgr = SubAgentManager(parent=None)
+    mgr.resume = AsyncMock(return_value=SubAgentResult("i", "t", "ok", 0, 1))
+    tool = make_answer_subagent_tool(mgr)
+    assert (await tool.handler(message="hi"))["success"] is False
+    assert (await tool.handler(session_id="s"))["success"] is False
+    out = await tool.handler(session_id="s", message="hi")
+    assert out["response"] == "ok"
+    mgr.resume.assert_awaited_with("s", "hi")
+
+
+def test_answer_subagent_tool_is_registered_and_depth_limited(agent):
+    assert agent.tool_registry.get("answer_subagent") is not None
+    deep = agent.sessions.create(kind="subagent", metadata={"depth": agent.settings.subagent_max_depth})
+    names = {d["function"]["name"] for d in agent.tool_definitions(deep)}
+    assert "answer_subagent" not in names
+    shallow = agent.sessions.create(kind="chat")
+    assert "answer_subagent" in {d["function"]["name"] for d in agent.tool_definitions(shallow)}

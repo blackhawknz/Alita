@@ -109,6 +109,10 @@ Open the UI, go to **Settings → Model**, pick a provider, paste a key and clic
 
 The `terminal` and `execute_code` tools are **off on the host by default**. Enable them in **Settings → Agent → Allow host command execution**, or run the backend in Docker. Destructive operations still pause for your approval in auto mode: deleting or overwriting files, `rm`/`Remove-Item`, `git push --force`/`reset --hard`, SQL writes, and similar. Background runs (jobs, sub-agents, kanban) can't ask, so they deny such calls unless `ALITA_HEADLESS_APPROVAL=allow`.
 
+### Sub-agents and structured reports
+
+`delegate_task` starts a child session with its own context and iteration budget. Sub-agents are instructed to finish with a fenced `report` block: `{"kind": "progress" | "waiting" | "ready" | "blocked" | "failed" | "dropped", "summary": "...", "evidence": [...], "question": "..."}`. The result carries the parsed `report`. When a worker returns `waiting`, call `answer_subagent` with its `session_id` and your answer — the same session resumes (the child is reloaded from SQLite, not recreated). Messages without a report are treated as `ready`.
+
 ---
 
 ## Configuration

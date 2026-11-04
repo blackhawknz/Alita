@@ -169,7 +169,7 @@ class AlitaAgent:
         self.tool_registry = ToolRegistry()
         self._register_builtin_tools(easy_diffusion_url or os.getenv("EASY_DIFFUSION_URL", "http://localhost:9000"))
 
-        from ..tools.subagent import SubAgentManager, make_subagent_tool
+        from ..tools.subagent import SubAgentManager, make_answer_subagent_tool, make_subagent_tool
         from ..executors.base import Executor
         from ..executors.native import NativeExecutor
         from ..tools.kanban_tool import make_kanban_tool
@@ -183,6 +183,7 @@ class AlitaAgent:
         self.subagent_manager = SubAgentManager(self, default_max_iterations=self.settings.subagent_max_iterations)
         self.executors: Dict[str, Executor] = {"native": NativeExecutor(self.subagent_manager)}
         self.tool_registry.register(make_subagent_tool(self.subagent_manager))
+        self.tool_registry.register(make_answer_subagent_tool(self.subagent_manager))
         self.kanban_store = KanbanStore(str(self.sqlite.db_path))
         self.kanban_executor = KanbanExecutor(self.kanban_store, self.subagent_manager)
         self.tool_registry.register(make_kanban_tool(self.kanban_store))
@@ -329,7 +330,7 @@ class AlitaAgent:
     def tool_definitions(self, sess: Optional[Session] = None) -> List[Dict[str, Any]]:
         defs = self.tool_registry.list_definitions()
         if sess is not None and sess.depth >= self.settings.subagent_max_depth:
-            defs = [d for d in defs if d["function"]["name"] != "delegate_task"]
+            defs = [d for d in defs if d["function"]["name"] not in ("delegate_task", "answer_subagent")]
         if sess is not None and sess.kind == "subagent":
             defs = [d for d in defs if d["function"]["name"] not in ("kanban", "skill_manage", "core_memory")]
         if sess is not None and sess.kind != "chat":
