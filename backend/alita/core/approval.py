@@ -20,6 +20,11 @@ Two cooperating components live here so they can be tested in isolation:
        auto-denied (default 300; set 0 to disable auto-deny).
      - ``ALITA_APPROVAL_ALLOWLIST`` — comma-separated tool names that skip the
        gate even in ``auto`` mode (e.g. ``file_ops,terminal``).
+     - ``ALITA_APPROVAL_EXECUTE_CODE_CAPABILITIES`` — ``true`` (default) gates
+       ``execute_code`` by statically analysed capabilities; ``false`` restores
+       the older destructive-pattern blocklist only.
+     - ``ALITA_APPROVAL_EXECUTE_CODE_STRICT`` — ``true`` gates any capability
+       at all (including ``fs_read``); default ``false``.
 
 2. **ApprovalCoordinator** — async registry of pending approvals. Each gated
    tool call creates a future keyed by ``approval_id``; the agent loop awaits
@@ -35,11 +40,30 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from .capabilities import (
+    CAP_ENV,
+    CAP_EVAL,
+    CAP_FS_DELETE,
+    CAP_FS_WRITE,
+    CAP_NETWORK,
+    CAP_PROCESS,
+    AnalysisResult,
+    analyse,
+)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 # ─── Policy ────────────────────────────────────────────────────────
@@ -196,6 +220,8 @@ class ApprovalPolicy:
         allowlist: Optional[List[str]] = None,
         timeout: Optional[float] = None,
         workspace_dir: Optional[str] = None,
+        execute_code_capabilities: Optional[bool] = None,
+        execute_code_strict: Optional[bool] = None,
     ):
         env_mode = os.getenv("ALITA_APPROVAL_MODE", "auto").lower()
         self.mode = (mode or env_mode).lower()
@@ -217,6 +243,18 @@ class ApprovalPolicy:
         self.workspace_dir = workspace_dir
         #: Gate every MCP tool call (their side effects cannot be introspected).
         self.gate_mcp = os.getenv("ALITA_APPROVAL_GATE_MCP", "false").strip().lower() == "true"
+
+        if execute_code_capabilities is None:
+            execute_code_capabilities = _env_bool(
+                "ALITA_APPROVAL_EXECUTE_CODE_CAPABILITIES", True
+            )
+        self.execute_code_capabilities = bool(execute_code_capabilities)
+
+        if execute_code_strict is None:
+            execute_code_strict = _env_bool(
+                "ALITA_APPROVAL_EXECUTE_CODE_STRICT", False
+            )
+        self.execute_code_strict = bool(execute_code_strict)
 
     # – Public API ─────────────────────────────────────────────────
 
@@ -383,19 +421,195 @@ class ApprovalPolicy:
         code = params.get("code") or ""
         if not code:
             return ApprovalDecision(needs_approval=False)
-        label = self._match_patterns(code, self._DESTRUCTIVE_CMD_PATTERNS + _DESTRUCTIVE_CODE_PATTERNS)
-        if label:
-            preview = code.strip().split("\n")[0][:120]
-            return ApprovalDecision(
-                needs_approval=True,
-                reason=(
-                    "This runs code directly on your machine, outside the sandbox, with "
-                    "your full user permissions. execute_code contains destructive "
-                    f"pattern ({label}): {preview!r}"
-                ),
-                severity="danger",
+        code = str(code)
+        language = params.get("language") or "python"
+
+        # The old blocklist stays as an extra trigger: it is cheap and still
+        # catches destructive strings (especially in shell snippets) that a
+        # capability summary does not spell out.
+        label = self._match_patterns(
+            code, self._DESTRUCTIVE_CMD_PATTERNS + _DESTRUCTIVE_CODE_PATTERNS
+        )
+
+        if not self.execute_code_capabilities:
+            if label:
+                return self._destructive_code_decision(code, label)
+            return ApprovalDecision(needs_approval=False)
+
+        result = analyse(code, language)
+        if result.failed:
+            detail = (result.detail or "unknown language or parse failure")[:200]
+            reason = (
+                "execute_code could not be analysed "
+                f"({detail}) and is assumed capable of writing files, spawning "
+                "processes, accessing the network and running dynamic code. "
+                "This runs on your machine with your full user permissions."
             )
-        return ApprovalDecision(needs_approval=False)
+            if label:
+                reason += f" It also matches destructive pattern ({label})."
+            return ApprovalDecision(
+                needs_approval=True, reason=reason, severity="danger"
+            )
+
+        caps = set(result.capabilities)
+        deletes = bool(CAP_FS_DELETE in caps)
+        outside = self._outside_write_paths(result)
+        overwrites = self._existing_write_paths(result)
+        unknown_write = result.unknown_write_path or (
+            CAP_FS_WRITE in caps and not result.write_paths
+        )
+
+        actions: List[str] = []
+        if deletes:
+            paths = sorted(result.delete_paths)
+            if paths:
+                actions.append(
+                    f"delete files ({self._summarise_paths(paths)})"
+                )
+            else:
+                actions.append("delete files")
+        if outside:
+            actions.append(
+                f"write files outside the workspace ({self._summarise_paths(outside)})"
+            )
+        if overwrites:
+            actions.append(
+                f"overwrite existing files ({self._summarise_paths(overwrites)})"
+            )
+        if unknown_write:
+            actions.append("write files to an unknown destination")
+        if CAP_PROCESS in caps:
+            actions.append("spawn processes")
+        if CAP_NETWORK in caps:
+            actions.append("access the network")
+        if CAP_EVAL in caps:
+            actions.append("execute dynamically generated code")
+        if CAP_ENV in caps:
+            actions.append("read environment variables or credentials")
+
+        danger = bool(
+            deletes or outside or overwrites or unknown_write
+            or CAP_PROCESS in caps or CAP_EVAL in caps
+        )
+        warning = bool(CAP_NETWORK in caps or CAP_ENV in caps)
+
+        strict_trigger = self.execute_code_strict and bool(caps)
+        if strict_trigger and not actions:
+            actions.append(
+                "use capabilities (" + ", ".join(sorted(caps)) + ")"
+            )
+
+        needs_approval = bool(label or danger or warning or strict_trigger)
+        if not needs_approval:
+            return ApprovalDecision(needs_approval=False)
+
+        parts: List[str] = []
+        if label:
+            parts.append(f"matches a destructive pattern ({label})")
+        if actions:
+            parts.append("will " + self._join_actions(actions))
+        preview = code.strip().split("\n")[0][:120]
+        reason = (
+            "execute_code " + " and ".join(parts)
+            + f": {preview!r}. This runs on your machine with your full user "
+            "permissions."
+        )
+        severity = "danger" if (label or danger or CAP_FS_WRITE in caps) else "warning"
+        return ApprovalDecision(
+            needs_approval=True, reason=reason, severity=severity
+        )
+
+    @staticmethod
+    def _join_actions(actions: List[str]) -> str:
+        if len(actions) == 1:
+            return actions[0]
+        if len(actions) == 2:
+            return f"{actions[0]} and {actions[1]}"
+        return ", ".join(actions[:-1]) + " and " + actions[-1]
+
+    def _destructive_code_decision(self, code: str, label: str) -> ApprovalDecision:
+        preview = code.strip().split("\n")[0][:120]
+        return ApprovalDecision(
+            needs_approval=True,
+            reason=(
+                "execute_code matches a destructive pattern "
+                f"({label}): {preview!r}. This runs on your machine with your "
+                "full user permissions."
+            ),
+            severity="danger",
+        )
+
+    def _outside_write_paths(self, result: AnalysisResult) -> List[str]:
+        return [
+            path for path in sorted(result.write_paths)
+            if not self._is_safe_write_path(path)
+        ]
+
+    def _existing_write_paths(self, result: AnalysisResult) -> List[str]:
+        """Safe-looking writes that would overwrite something already there.
+
+        Creating a new file inside the workspace or temp cwd stays
+        frictionless; truncating/overwriting an existing file is destructive
+        and is gated even though the path itself is "inside".
+        """
+        return [
+            path for path in sorted(result.overwrite_paths)
+            if self._is_safe_write_path(path) and self._write_target_exists(path)
+        ]
+
+    @staticmethod
+    def _summarise_paths(paths: List[str]) -> str:
+        shown = ", ".join(paths[:3])
+        if len(paths) > 3:
+            shown += f", and {len(paths) - 3} more"
+        return shown
+
+    @staticmethod
+    def _resolve_write_candidate(path: str) -> Optional[Path]:
+        """Resolve a snippet path the way ``execute_code`` would see it."""
+        try:
+            raw = str(path)
+            if not raw:
+                return None
+            candidate = Path(raw)
+            if not os.path.isabs(raw):
+                candidate = Path(tempfile.gettempdir()) / raw
+            return candidate.resolve(strict=False)
+        except (OSError, ValueError, RuntimeError):
+            return None
+
+    def _write_target_exists(self, path: str) -> bool:
+        candidate = self._resolve_write_candidate(path)
+        if candidate is None:
+            return False
+        try:
+            return candidate.exists()
+        except (OSError, ValueError):
+            # If we cannot tell, the write is not provably new: gate it.
+            return True
+
+    def _is_safe_write_path(self, path: str) -> bool:
+        """Whether ``path`` is inside the workspace or the snippet's temp cwd.
+
+        Relative paths are resolved against the snippet's temp working
+        directory (``execute_code`` runs there). Anything we cannot resolve is
+        treated as unsafe, so it prompts.
+        """
+        candidate = self._resolve_write_candidate(path)
+        if candidate is None:
+            return False
+
+        try:
+            roots: List[Path] = []
+            if self.workspace_dir:
+                roots.append(Path(self.workspace_dir).resolve(strict=False))
+            roots.append(Path(tempfile.gettempdir()).resolve(strict=False))
+            for root in roots:
+                if candidate == root or candidate.is_relative_to(root):
+                    return True
+            return False
+        except (OSError, ValueError, RuntimeError):
+            return False
 
 
 # ─── Coordinator ─────────────────────────────────────────────────

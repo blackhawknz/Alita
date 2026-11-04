@@ -143,25 +143,61 @@ def test_execute_code_with_rm_gated():
     assert d.severity == "danger"
 
 
-def test_execute_code_approval_warns_unsandboxed():
+def test_execute_code_approval_warns_host_exec():
     p = ApprovalPolicy(mode="auto")
     d = p.classify("execute_code", {"code": "import shutil; shutil.rmtree('build')"})
     assert d.needs_approval is True
-    assert "outside the sandbox" in d.reason
+    assert "runs on your machine" in d.reason
     assert "full user permissions" in d.reason
 
 
-def test_execute_code_schema_warns_unsandboxed():
+def test_execute_code_schema_warns_host_exec():
     from alita.tools.code_execution import CodeExecutionTool
 
     description = CodeExecutionTool.definition["description"]
-    assert "outside the sandbox" in description
     assert "full user permissions" in description
+    assert "approval prompts are the only control" in description
 
 
 def test_execute_code_benign_allowed():
     p = ApprovalPolicy(mode="auto")
     d = p.classify("execute_code", {"code": "print('hello')"})
+    assert d.needs_approval is False
+
+
+def test_execute_code_aliased_delete_inside_workspace_gated(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "keep.txt"
+    target.write_text("keep")
+    p = ApprovalPolicy(mode="auto", workspace_dir=str(workspace))
+    code = f"import os as o\no.remove({str(target)!r})"
+    d = p.classify("execute_code", {"code": code})
+    assert d.needs_approval is True
+    assert d.severity == "danger"
+
+
+def test_execute_code_overwrite_existing_workspace_file_gated(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "keep.txt"
+    target.write_text("keep")
+    p = ApprovalPolicy(mode="auto", workspace_dir=str(workspace))
+    d = p.classify(
+        "execute_code", {"code": f'open({str(target)!r}, "w").write("")'}
+    )
+    assert d.needs_approval is True
+    assert d.severity == "danger"
+
+
+def test_execute_code_create_new_workspace_file_allowed(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "new.txt"
+    p = ApprovalPolicy(mode="auto", workspace_dir=str(workspace))
+    d = p.classify(
+        "execute_code", {"code": f'open({str(target)!r}, "w").write("hi")'}
+    )
     assert d.needs_approval is False
 
 
