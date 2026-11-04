@@ -118,8 +118,9 @@ class CodeExecutionTool:
         "name": "execute_code",
         "description": (
             "Execute a code snippet in a host subprocess (temp directory) and return "
-            "stdout/stderr. WARNING: this runs code directly on your machine, outside "
-            "the sandbox, with your full user permissions. Supports Python, JavaScript "
+            "stdout/stderr. WARNING: this runs code directly on your machine with "
+            "your full user permissions; approval prompts are the only control. "
+            "Supports Python, JavaScript "
             "(node), TypeScript (npx ts-node), bash (Git Bash on Windows) and "
             f"PowerShell. Output is capped at {_MAX_OUTPUT} characters per stream. "
             f"Max timeout is {_MAX_TIMEOUT} seconds."

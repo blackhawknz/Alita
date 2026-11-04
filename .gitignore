@@ -41,3 +41,8 @@ Dashboards/
 # OS
 .DS_Store
 Thumbs.db
+
+# Alita driver scratch (briefs handed to OpenCode, per-run OpenCode configs)
+.alita/
+.alita-briefs/
+
