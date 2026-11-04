@@ -7,7 +7,9 @@ written back into ``usage_events`` (see C1-f3). Prices are USD per 1M tokens.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, Tuple
+import calendar
+from datetime import datetime, timezone
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 # USD per 1M tokens. Cache-hit input is far cheaper than cache-miss input.
 PRICES: Dict[str, Dict[str, float]] = {
@@ -106,3 +108,95 @@ def events_cost(events: Iterable[Dict[str, Any]]) -> float:
         )
         for event in events
     )
+
+
+def _local_now(now: Optional[datetime] = None) -> datetime:
+    if now is None:
+        return datetime.now().astimezone()
+    if now.tzinfo is None:
+        return now.astimezone()
+    return now
+
+
+def _parse_utc(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def month_start_utc(now: Optional[datetime] = None) -> datetime:
+    """UTC instant corresponding to local midnight on the first of the month."""
+    local = _local_now(now)
+    start = datetime(local.year, local.month, 1, tzinfo=local.tzinfo)
+    return start.astimezone(timezone.utc)
+
+
+def summarize_spend(
+    events: Iterable[Dict[str, Any]],
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Build the ``spend`` object for the current local month.
+
+    ``month_to_date`` and ``projected_month`` use the server's local date. The
+    projection is clamped so the first day of a month still yields a sensible
+    single-day value rather than dividing by zero.
+    """
+    local = _local_now(now)
+    start_utc = month_start_utc(local)
+    period = local.strftime("%Y-%m")
+
+    month_to_date = 0.0
+    by_source: Dict[str, float] = {}
+    by_model: Dict[str, float] = {}
+    by_day: Dict[str, float] = {}
+    pricing_known = True
+
+    for event in events:
+        created = _parse_utc(event.get("created_at"))
+        if created is None or created < start_utc:
+            continue
+        rates, known = get_price(event.get("model"))
+        if not known:
+            pricing_known = False
+        cost = cost_from_rates(
+            rates,
+            event.get("prompt_tokens") or 0,
+            event.get("completion_tokens") or 0,
+            event.get("cached_tokens") or 0,
+        )
+        model_name = str(event.get("model") or "")
+        source_name = str(event.get("source") or "")
+        if not cost:
+            # Still surface the model/source, without adding a zero-cost day.
+            by_model.setdefault(model_name, 0.0)
+            by_source.setdefault(source_name, 0.0)
+            continue
+        month_to_date += cost
+        by_source[source_name] = by_source.get(source_name, 0.0) + cost
+        by_model[model_name] = by_model.get(model_name, 0.0) + cost
+        day = created.astimezone(local.tzinfo).date().isoformat()
+        by_day[day] = by_day.get(day, 0.0) + cost
+
+    days_elapsed = max(1, local.day)
+    days_in_month = calendar.monthrange(local.year, local.month)[1]
+    projected = month_to_date / days_elapsed * days_in_month
+
+    return {
+        "pricing_known": pricing_known,
+        "currency": "USD",
+        "period": period,
+        "month_to_date": round(month_to_date, 6),
+        "projected_month": round(projected, 6),
+        "by_source": {key: round(value, 6) for key, value in by_source.items()},
+        "by_model": {key: round(value, 6) for key, value in by_model.items()},
+        "by_day": [
+            {"date": day, "cost": round(by_day[day], 6)}
+            for day in sorted(by_day)
+        ],
+    }

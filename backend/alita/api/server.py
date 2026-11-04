@@ -26,7 +26,7 @@ from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse,
 from pydantic import BaseModel, Field
 
 from .. import __version__
-from ..core import config
+from ..core import config, pricing
 from ..core.agent import AlitaAgent
 from ..core.attachments import build_user_content, get_upload, save_upload
 from ..core.session import Session
@@ -307,6 +307,14 @@ async def usage_summary(
         " GROUP BY model ORDER BY prompt_tokens DESC",
         params,
     )
+    now_local = datetime.now().astimezone()
+    month_start = pricing.month_start_utc(now_local).strftime("%Y-%m-%d %H:%M:%S")
+    spend_events = db.query(
+        "SELECT source, model, prompt_tokens, completion_tokens, cached_tokens, created_at "
+        "FROM usage_events WHERE created_at >= ?",
+        (month_start,),
+    )
+    spend = pricing.summarize_spend(spend_events, now=now_local)
     return {
         "since": since_sql,
         "until": until_sql,
@@ -318,6 +326,7 @@ async def usage_summary(
         },
         "by_day": by_day,
         "by_model": by_model,
+        "spend": spend,
     }
 
 
